@@ -42,10 +42,10 @@ cd tv && git pull && makepkg -si && systemctl --user restart tv-pad
 |---|---|
 | lewa gałka | mysz (wolno przy lekkim wychyleniu, szybciej przy pełnym, przyspiesza po chwili) |
 | prawa gałka | przewijanie (góra/dół i na boki) |
-| RT | lewy przycisk myszy (przytrzymanie = przeciąganie) |
+| A | lewy przycisk myszy (przytrzymanie = przeciąganie) |
+| RT | Enter |
 | LT | prawy przycisk myszy |
 | L3 (wciśnięcie lewej gałki) | środkowy przycisk myszy |
-| A | Enter |
 | B | Esc |
 | X | klawiatura ekranowa (pokaż/ukryj) |
 | Y | Super+R (launcher aplikacji) |
@@ -54,10 +54,13 @@ cd tv && git pull && makepkg -si && systemctl --user restart tv-pad
 | **View + ←** | zakończ stream: monitor wraca, sterowanie padem gaśnie |
 | Start + B | Super+C (zamknij okno) |
 | LB / RB | Alt+← / Alt+→ (wstecz / dalej w przeglądarce) |
-| krzyżak | strzałki |
+| **↓ + LB / RB** | poprzedni / następny workspace |
+| **→ + LB / RB** | przenieś aktywne okno na poprzedni / następny workspace |
+| krzyżak | strzałki (↓ i → wysyłają strzałkę po puszczeniu, bo mogą zaczynać kombinację) |
 | przytrzymaj Xbox 1 s | pauza / wznowienie sterowania pulpitem |
 
-Skróty Super+R i Super+C muszą być ustawione w Hyprlandzie (np. `bind = SUPER, R, exec, wofi --show drun`,
+Workspace'y są przełączane bezpośrednio przez `hyprctl dispatch` (tv-pad sam rozpoznaje starą
+i nową, Lua, składnię). Skróty Super+R i Super+C muszą być ustawione w Hyprlandzie (np. `bind = SUPER, R, exec, wofi --show drun`,
 `bind = SUPER, C, killactive`). Hyprland nie ma domyślnie Alt+Tab; przykład:
 
 ```ini
@@ -80,8 +83,10 @@ Ustawienia: `watch_only_apps` (nazwy aplikacji w Sunshine), `watch_only_windows`
 Hyprland po wyłączeniu wyjścia (`dpms off`) przestaje renderować, więc stream by zamarzł.
 Dlatego karta graficzna dalej rysuje obraz, a tv-pad tylko **ściemnia podświetlenie monitora
 do zera** przez DDC/CI (`ddcutil`) i potem przywraca zapamiętaną jasność. Monitor cały czas
-działa, więc zawsze da się go przywrócić. Po zakończeniu lub wstrzymaniu streamu (a nawet po
-awarii tv-pad) jasność wraca automatycznie.
+działa, więc zawsze da się go przywrócić. Nic nie zostaje na stałe: jasność wraca po ponownym
+View + ↑, po zakończeniu lub wstrzymaniu streamu, po zatrzymaniu tv-pad, a nawet po awarii czy
+odcięciu prądu (poziom sprzed ściemnienia jest zapisany w `~/.local/state/tv-pad/brightness`
+i przywracany przy następnym starcie; jeśli jest nieznany, wraca 100%).
 
 ```bash
 sudo pacman -S ddcutil
