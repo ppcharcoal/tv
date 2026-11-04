@@ -122,6 +122,7 @@ tv.Session.__init__.__defaults__ = (lambda cmd: SESSION_CALLS.append(cmd) or Tru
 tv.BRIGHTNESS_FILE = os.path.join(tmp, "brightness")
 
 marks = {}
+FLAG_AFTER_END = []
 
 
 def mark(name):
@@ -188,6 +189,7 @@ def scenario():
     PAD.push(e.EV_KEY, e.BTN_SELECT, 0)
     time.sleep(1.2)
     mark("ended_by_pad")
+    FLAG_AFTER_END.append(os.path.exists(tv.ACTIVE_FLAG))
     PAD.push(e.EV_KEY, e.BTN_SOUTH, 1)
     PAD.push(e.EV_KEY, e.BTN_SOUTH, 0)
     time.sleep(0.3)
@@ -195,6 +197,23 @@ def scenario():
         os.remove(tv.ACTIVE_FLAG)               # Sunshine: tv-pad off (already gone)
     except FileNotFoundError:
         pass
+    time.sleep(1.0)
+    mark("before_steam")
+    os.environ["SUNSHINE_APP_NAME"] = "Steam Big Picture"   # Sunshine streams Steam
+    tv.cmd_on()
+    sunshine_log("CLIENT CONNECTED")
+    time.sleep(1.2)
+    PAD.push(e.EV_KEY, e.BTN_SOUTH, 1)          # A goes to Steam, not to the desktop
+    PAD.push(e.EV_KEY, e.BTN_SOUTH, 0)
+    PAD.push(e.EV_ABS, e.ABS_X, 32767)          # stick does not move the mouse
+    time.sleep(0.3)
+    PAD.push(e.EV_ABS, e.ABS_X, 0)
+    PAD.push(e.EV_KEY, e.BTN_SELECT, 1)         # View + Left still ends the stream
+    PAD.push(e.EV_ABS, e.ABS_HAT0X, -1)
+    PAD.push(e.EV_ABS, e.ABS_HAT0X, 0)
+    PAD.push(e.EV_KEY, e.BTN_SELECT, 0)
+    time.sleep(1.2)
+    mark("steam_done")
     time.sleep(1.2)
     mark("stream_off")
     os.kill(os.getpid(), signal.SIGTERM)
@@ -203,4 +222,4 @@ def scenario():
 threading.Thread(target=scenario, daemon=True).start()
 tv.run_daemon()
 print(json.dumps({"log": LOG, "grabs": GRABS, "marks": marks, "notes": NOTES, "session": SESSION_CALLS,
-                  "flag_after_end": os.path.exists(tv.ACTIVE_FLAG)}))
+                  "flag_after_end": FLAG_AFTER_END[0], "flag_after_steam": os.path.exists(tv.ACTIVE_FLAG)}))

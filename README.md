@@ -65,6 +65,16 @@ bind = ALT, TAB, cyclenext
 bind = ALT, TAB, bringactivetotop
 ```
 
+## Steam Big Picture
+
+Gdy Sunshine streamuje aplikację ze „Steam” w nazwie (np. „Steam Big Picture”) albo na
+pierwszym planie jest okno Steama lub gry ze Steama, pad zostaje w całości dla Steama:
+tv-pad nie steruje myszą ani klawiaturą, działa tylko **View + ←** (koniec streamu).
+Nazwę aplikacji przekazuje Sunshine (`SUNSHINE_APP_NAME`); `tv-pad status` pokazuje, co widzi.
+
+Ustawienia: `watch_only_apps` (nazwy aplikacji w Sunshine), `watch_only_windows` (klasy okien),
+`watch_only_combos` (kombinacje, które wtedy działają).
+
 ## Wygaszanie monitora (View + ↑)
 
 Hyprland po wyłączeniu wyjścia (`dpms off`) przestaje renderować, więc stream by zamarzł.

@@ -417,6 +417,45 @@ class SunshineApiTests(unittest.TestCase):
         srv.server_close()
 
 
+class SteamModeTests(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        d = tempfile.mkdtemp()
+        self.old = (tv.ACTIVE_FLAG, tv.STATE_DIR)
+        tv.ACTIVE_FLAG, tv.STATE_DIR = os.path.join(d, "active"), d
+
+    def tearDown(self):
+        tv.ACTIVE_FLAG, tv.STATE_DIR = self.old
+        os.environ.pop("SUNSHINE_APP_NAME", None)
+
+    def test_flag_keeps_the_sunshine_app_name(self):
+        os.environ["SUNSHINE_APP_NAME"] = "Steam Big Picture"
+        tv.cmd_on()
+        self.assertEqual(tv.read_stream_app(), "Steam Big Picture")
+
+    def test_old_flag_format_and_missing_name(self):
+        with open(tv.ACTIVE_FLAG, "w") as f:
+            f.write("1730730000.5")
+        self.assertEqual(tv.read_stream_app(), "")
+        tv.cmd_on()  # no SUNSHINE_APP_NAME
+        self.assertEqual(tv.read_stream_app(), "")
+
+    def test_watch_only_mapper_ignores_everything_but_view_left(self):
+        out = FakeOut()
+        m = tv.Mapper(tv.watch_only_config(tv.merge_config({})), e, out)
+        for name in ["A", "B", "X", "Y", "RT", "LT", "Up", "Left"]:
+            m.control(name, True)
+            m.control(name, False)
+        m.control("View", True)
+        m.control("View", False)               # View alone: nothing (no Alt+Tab)
+        self.assertEqual(out.events, [])
+        m.control("View", True)
+        m.control("Left", True)
+        m.control("Left", False)
+        m.control("View", False)
+        self.assertEqual(out.events, [("end-stream",)])
+
+
 class ConfigTests(unittest.TestCase):
     def test_merge(self):
         cfg = tv.merge_config({"mouse_speed": 900, "swap_xy": 1, "buttons": {"A": "key:SPACE", "B": 5},

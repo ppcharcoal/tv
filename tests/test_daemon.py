@@ -71,7 +71,7 @@ class DaemonTest(unittest.TestCase):
         self.assertEqual(grabs, ["grab"])
 
     def test_view_left_ends_stream(self):
-        self.assertEqual(self.r["session"], ["api-close"])
+        self.assertEqual(self.r["session"][0], "api-close")
         self.assertFalse(self.r["flag_after_end"])
         self.assertTrue(any("Kończę stream" in n for n in self.r["notes"]))
         # neither the arrow key nor Alt+Tab went to the desktop, and the pad was let go
@@ -80,8 +80,19 @@ class DaemonTest(unittest.TestCase):
         self.assertEqual(grabs, ["ungrab"])
 
     def test_stream_end(self):
-        self.assertEqual(self.keys(self.log[self.marks["ended_by_pad"][0]:]), [])
+        self.assertEqual(self.keys(self.between("ended_by_pad", "before_steam")), [])
         self.assertEqual(self.r["grabs"][-1], "ungrab")
+
+    def test_steam_stream_leaves_pad_to_the_game(self):
+        steam = self.log[self.marks["before_steam"][0]:self.marks["steam_done"][0]]
+        self.assertEqual(steam, [], "no keys and no mouse movement on the desktop during a Steam stream")
+        grabs = self.r["grabs"][self.marks["before_steam"][1]:self.marks["steam_done"][1]]
+        self.assertNotIn("grab", grabs)
+        self.assertTrue(any("Steam" in n for n in self.r["notes"]))
+
+    def test_steam_stream_ends_with_view_left(self):
+        self.assertEqual(self.r["session"], ["api-close", "api-close"])
+        self.assertFalse(self.r["flag_after_steam"])
 
 
 if __name__ == "__main__":
