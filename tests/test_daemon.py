@@ -44,8 +44,8 @@ class DaemonTest(unittest.TestCase):
     def test_buttons(self):
         keys = self.keys(self.between("moved", "buttons"))
         self.assertEqual(keys, [
-            (e.KEY_ENTER, 1), (e.KEY_ENTER, 0),
             (e.BTN_LEFT, 1), (e.BTN_LEFT, 0),
+            (e.KEY_ENTER, 1), (e.KEY_ENTER, 0),
             (e.KEY_LEFTMETA, 1), (e.KEY_C, 1), (e.KEY_C, 0), (e.KEY_LEFTMETA, 0),
         ])
 
@@ -57,7 +57,10 @@ class DaemonTest(unittest.TestCase):
     def test_user_pause_with_xbox_hold(self):
         self.assertTrue(any("pauza" in n for n in self.r["notes"]))
         events = self.log[self.marks["pressed_in_game"][0]:self.marks["user_paused"][0]]
-        self.assertNotIn((e.KEY_ENTER, 1), self.keys(events))
+        self.assertNotIn((e.BTN_LEFT, 1), self.keys(events))
+
+    def test_brightness_left_from_a_crash_is_restored_at_start(self):
+        self.assertEqual(self.r["session"][0], ["ddcutil", "--noverify", "setvcp", "10", "33"])
 
     def test_paused_stream_releases_pad(self):
         self.assertEqual(self.keys(self.between("user_paused", "stream_paused")), [])
@@ -66,12 +69,12 @@ class DaemonTest(unittest.TestCase):
 
     def test_resumed_stream_takes_pad_again(self):
         self.assertEqual(self.keys(self.between("stream_paused", "stream_resumed")),
-                         [(e.KEY_ENTER, 1), (e.KEY_ENTER, 0)])
+                         [(e.BTN_LEFT, 1), (e.BTN_LEFT, 0)])
         grabs = self.r["grabs"][self.marks["stream_paused"][1]:self.marks["stream_resumed"][1]]
         self.assertEqual(grabs, ["grab"])
 
     def test_view_left_ends_stream(self):
-        self.assertEqual(self.r["session"][0], "api-close")
+        self.assertIn("api-close", self.r["session"])
         self.assertFalse(self.r["flag_after_end"])
         self.assertTrue(any("Kończę stream" in n for n in self.r["notes"]))
         # neither the arrow key nor Alt+Tab went to the desktop, and the pad was let go
@@ -91,7 +94,7 @@ class DaemonTest(unittest.TestCase):
         self.assertTrue(any("Steam" in n for n in self.r["notes"]))
 
     def test_steam_stream_ends_with_view_left(self):
-        self.assertEqual(self.r["session"], ["api-close", "api-close"])
+        self.assertEqual(self.r["session"][1:], ["api-close", "api-close"])
         self.assertFalse(self.r["flag_after_steam"])
 
 

@@ -24,11 +24,13 @@ import threading
 import time
 import urllib.request
 
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 APP = "tv-pad"
 
 RUNTIME_DIR = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
 STATE_DIR = os.path.join(RUNTIME_DIR, APP)
+# Survives reboots: what must be undone after a crash or power loss (monitor brightness).
+PERSIST_DIR = os.path.join(os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"), APP)
 ACTIVE_FLAG = os.path.join(STATE_DIR, "active")
 CONFIG_HOME = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
 CONFIG_PATH = os.path.join(CONFIG_HOME, APP, "config.json")
@@ -66,18 +68,19 @@ DEFAULT_CONFIG = {
     #   "mouse:LEFT"  hold a mouse button (LEFT, RIGHT, MIDDLE, SIDE, EXTRA)
     #   "osk"         show/hide the on-screen keyboard
     #   "cmd:..."     run a shell command when pressed
+    #   "hypr:..."    Hyprland dispatcher, e.g. "hypr:workspace +1" (old and Lua hyprctl syntax)
     #   "screen"      turn the PC monitor off / on (the stream keeps running)
     #   "end-stream"  end the stream, turn the monitor back on, stop pad control
     #   "none"
     "buttons": {
-        "A": "key:ENTER",
+        "A": "mouse:LEFT",
         "B": "key:ESC",
         "X": "osk",
         "Y": "key:LEFTMETA+R",
         "LB": "key:LEFTALT+LEFT",
         "RB": "key:LEFTALT+RIGHT",
         "LT": "mouse:RIGHT",
-        "RT": "mouse:LEFT",
+        "RT": "key:ENTER",
         "L3": "mouse:MIDDLE",
         "R3": "none",
         "View": "key:LEFTALT+TAB",
@@ -93,6 +96,10 @@ DEFAULT_CONFIG = {
         "Start+B": "key:LEFTMETA+C",
         "View+Up": "screen",
         "View+Left": "end-stream",
+        "Down+LB": "hypr:workspace -1",
+        "Down+RB": "hypr:workspace +1",
+        "Right+LB": "hypr:movetoworkspace -1",
+        "Right+RB": "hypr:movetoworkspace +1",
     },
     # PC monitor off / on during a stream (View + Up). Turning the output off in Hyprland
     # (dpms) stops rendering and would freeze the stream, so the GPU keeps drawing and only
@@ -183,6 +190,11 @@ def parse_action(text, ecodes):
         return Action(text)
     if text.startswith("cmd:"):
         return Action("cmd", command=text[4:].strip())
+    if text.startswith("hypr:"):
+        command = text[5:].strip()
+        if not command:
+            raise ValueError(f"empty Hyprland dispatcher in {text!r}")
+        return Action("hypr", command=command)
     if text.startswith("mouse:"):
         name = MOUSE_BUTTONS.get(text[6:].strip().upper())
         if not name:
@@ -250,6 +262,8 @@ class Mapper:
             self.out.osk_toggle()
         elif action.kind == "screen":
             self.out.screen_toggle()
+        elif action.kind == "hypr":
+            self.out.hypr(action.command)
         elif action.kind == "end-stream":
             self.out.end_stream()
         elif action.kind == "cmd" and action.command:
@@ -575,7 +589,38 @@ def parse_brightness(text):
     return int(m.group(1)) if m else None
 
 
-BRIGHTNESS_FILE = os.path.join(STATE_DIR, "brightness")
+BRIGHTNESS_FILE = os.path.join(PERSIST_DIR, "brightness")
+DEFAULT_BRIGHTNESS = 100  # used when the level before dimming is unknown
+
+
+def hypr_dispatch_forms(command):
+    """The ways to send a dispatcher with hyprctl: classic syntax first, then the Lua-config
+    syntax (`hyprctl dispatch` wraps the argument in hl.dispatch(...))."""
+    dispatcher, _, args = command.partition(" ")
+    lua = lambda v: '"' + v.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    forms = [["hyprctl", "dispatch", dispatcher] + ([args] if args else [])]
+    forms.append(["hyprctl", "dispatch", f"{lua(dispatcher)}, {lua(args)}" if args else lua(dispatcher)])
+    forms.append(["hyprctl", "dispatch", lua(command)])
+    return forms
+
+
+class Hypr:
+    """Runs Hyprland dispatchers, remembering which hyprctl syntax this Hyprland accepts."""
+
+    def __init__(self, query=None):
+        self.query = query or (lambda cmd: query_quiet(cmd, timeout=3))
+        self.form = None
+
+    def dispatch(self, command):
+        forms = hypr_dispatch_forms(command)
+        order = [self.form] + [i for i in range(len(forms)) if i != self.form] if self.form is not None else range(len(forms))
+        for i in order:
+            out = self.query(forms[i])
+            if out is not None and out.strip().lower() == "ok":
+                self.form = i
+                return True
+        log(f"hyprctl did not accept: {command}")
+        return False
 
 
 def sunshine_close_app(cfg):
@@ -645,13 +690,15 @@ class Session:
     def _dim(self):
         level = parse_brightness(self.query(["ddcutil", "--brief", "getvcp", "10"]))
         if level:
-            os.makedirs(STATE_DIR, exist_ok=True)
+            os.makedirs(PERSIST_DIR, exist_ok=True)
             with open(BRIGHTNESS_FILE, "w", encoding="utf-8") as f:
                 f.write(str(level))
+                f.flush()
+                os.fsync(f.fileno())  # must survive a power cut while the monitor is dark
         self.run(["ddcutil", "--noverify", "setvcp", "10", "0"])
 
     def _restore(self, level=None):
-        level = level or self._read_saved() or 70
+        level = level or self._read_saved() or DEFAULT_BRIGHTNESS
         self.run(["ddcutil", "--noverify", "setvcp", "10", str(level)])
         try:
             os.remove(BRIGHTNESS_FILE)
@@ -712,6 +759,7 @@ class Desktop:
         self.osk = None
         self._dirty = set()  # devices with events waiting for a SYN
         self.session = Session(cfg)
+        self._hypr = Hypr()
 
     def key(self, code, down):
         dev = self.mouse if code in self.mouse_keys else self.keyboard
@@ -748,6 +796,9 @@ class Desktop:
         if self.osk and self.osk.poll() is None:
             self.osk.terminate()
         self.osk = None
+
+    def hypr(self, command):
+        threading.Thread(target=self._hypr.dispatch, args=(command,), daemon=True).start()
 
     def run(self, command):
         subprocess.Popen(["sh", "-c", command], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -870,6 +921,11 @@ def run_daemon():
             pass
         log(f"pad gone: {path}")
 
+    # The monitor may still be dark from a crash or power loss during an earlier stream.
+    if os.path.exists(BRIGHTNESS_FILE):
+        log("restoring monitor brightness left from an earlier stream")
+        Session(cfg, background=False)
+
     log(f"started (version {VERSION}); waiting for a stream")
     frame = 1 / 250
     last_tick = time.monotonic()
@@ -979,6 +1035,8 @@ def run_daemon():
     set_grab(False)
     if desktop:
         desktop.close()
+    elif os.path.exists(BRIGHTNESS_FILE):
+        Session(cfg, background=False)
     log("stopped")
 
 

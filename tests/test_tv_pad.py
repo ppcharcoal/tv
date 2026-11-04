@@ -41,6 +41,9 @@ class FakeOut:
     def run(self, cmd):
         self.events.append(("run", cmd))
 
+    def hypr(self, cmd):
+        self.events.append(("hypr", cmd))
+
     def notify(self, text):
         pass
 
@@ -71,16 +74,39 @@ class ActionTests(unittest.TestCase):
 
     def test_default_config_parses(self):
         m, _, _ = make()
-        self.assertEqual(m.buttons["A"], tv.Action("key", [e.KEY_ENTER]))
+        self.assertEqual(m.buttons["A"], tv.Action("mouse", [e.BTN_LEFT]))
+        self.assertEqual(m.buttons["RT"], tv.Action("key", [e.KEY_ENTER]))
+        self.assertEqual(m.combos[("Down", "RB")], tv.Action("hypr", command="workspace +1"))
         self.assertEqual(m.combos[("Start", "B")], tv.Action("key", [e.KEY_LEFTMETA, e.KEY_C]))
 
 
 class ButtonTests(unittest.TestCase):
-    def test_a_is_enter(self):
+    def test_a_is_left_click_and_rt_is_enter(self):
         m, out, _ = make()
         m.control("A", True)
         m.control("A", False)
-        self.assertEqual(out.keys(), [(e.KEY_ENTER, True), (e.KEY_ENTER, False)])
+        m.control("RT", True)
+        m.control("RT", False)
+        self.assertEqual(out.keys(), [(e.BTN_LEFT, True), (e.BTN_LEFT, False), (e.KEY_ENTER, True), (e.KEY_ENTER, False)])
+
+    def test_workspace_combos(self):
+        m, out, _ = make()
+        for mod, btn, expected in [("Down", "LB", "workspace -1"), ("Down", "RB", "workspace +1"),
+                                   ("Right", "LB", "movetoworkspace -1"), ("Right", "RB", "movetoworkspace +1")]:
+            out.events.clear()
+            m.control(mod, True)
+            m.control(btn, True)
+            m.control(btn, False)
+            m.control(mod, False)
+            self.assertEqual(out.events, [("hypr", expected)], (mod, btn))
+
+    def test_down_and_right_alone_are_still_arrows(self):
+        m, out, _ = make()
+        m.control("Down", True)
+        m.control("Down", False)
+        m.control("Right", True)
+        m.control("Right", False)
+        self.assertEqual(out.keys(), [(e.KEY_DOWN, True), (e.KEY_DOWN, False), (e.KEY_RIGHT, True), (e.KEY_RIGHT, False)])
 
     def test_b_alone_is_escape_and_start_b_is_super_c(self):
         m, out, _ = make()
@@ -147,7 +173,7 @@ class ButtonTests(unittest.TestCase):
         out.events.clear()
         m.release_all()
         released = {code for code, down in out.keys() if not down}
-        self.assertEqual(released, {e.BTN_LEFT, e.KEY_LEFTALT, e.KEY_LEFT})
+        self.assertEqual(released, {e.KEY_ENTER, e.KEY_LEFTALT, e.KEY_LEFT})
         self.assertEqual(m.held, {})
 
     def test_pause_hold(self):
@@ -168,9 +194,9 @@ class PadStateTests(unittest.TestCase):
     def test_trigger_hysteresis(self):
         self.pad.axis(e.ABS_RZ, 600, self.m)   # 0.59 -> press
         self.pad.axis(e.ABS_RZ, 450, self.m)   # 0.44 -> still pressed
-        self.assertEqual(self.out.keys(), [(e.BTN_LEFT, True)])
+        self.assertEqual(self.out.keys(), [(e.KEY_ENTER, True)])
         self.pad.axis(e.ABS_RZ, 100, self.m)   # 0.1 -> release
-        self.assertEqual(self.out.keys(), [(e.BTN_LEFT, True), (e.BTN_LEFT, False)])
+        self.assertEqual(self.out.keys(), [(e.KEY_ENTER, True), (e.KEY_ENTER, False)])
         self.pad.axis(e.ABS_Z, 1023, self.m)
         self.assertEqual(self.out.keys()[-1], (e.BTN_RIGHT, True))
 
@@ -332,11 +358,16 @@ class SessionTests(unittest.TestCase):
         s.screen_toggle(self.notes.append)
         self.assertFalse(any("D6" in c for c in self.calls if isinstance(c, list)))
 
-    def test_unknown_brightness_falls_back_to_70(self):
+    def test_unknown_brightness_falls_back_to_full(self):
         s = self.session(brightness=None)
         s.screen_toggle(self.notes.append)
         s.screen_toggle(self.notes.append)
-        self.assertEqual(self.calls[-1], ["ddcutil", "--noverify", "setvcp", "10", "70"])
+        self.assertEqual(self.calls[-1], ["ddcutil", "--noverify", "setvcp", "10", "100"])
+
+    def test_brightness_is_kept_outside_the_runtime_dir(self):
+        # /run/user is wiped on reboot; the level must survive a power cut while dimmed
+        self.assertFalse(self.old[1].startswith(tv.RUNTIME_DIR))
+        self.assertTrue(self.old[1].startswith(tv.PERSIST_DIR))
 
     def test_left_dimmed_by_previous_run_is_restored(self):
         with open(tv.BRIGHTNESS_FILE, "w") as f:
@@ -454,6 +485,33 @@ class SteamModeTests(unittest.TestCase):
         m.control("Left", False)
         m.control("View", False)
         self.assertEqual(out.events, [("end-stream",)])
+
+
+class HyprTests(unittest.TestCase):
+    def test_forms(self):
+        self.assertEqual(tv.hypr_dispatch_forms("workspace +1"), [
+            ["hyprctl", "dispatch", "workspace", "+1"],
+            ["hyprctl", "dispatch", '"workspace", "+1"'],
+            ["hyprctl", "dispatch", '"workspace +1"'],
+        ])
+
+    def test_finds_working_syntax_and_remembers_it(self):
+        tried = []
+
+        def query(cmd):
+            tried.append(cmd[2:])
+            # a Lua-config Hyprland: only the two-argument Lua form says "ok"
+            return "ok\n" if cmd[2] == '"workspace", "+1"' or cmd[2] == '"movetoworkspace", "-1"' else "error: 3 ..."
+
+        h = tv.Hypr(query)
+        self.assertTrue(h.dispatch("workspace +1"))
+        self.assertEqual(len(tried), 2)
+        tried.clear()
+        self.assertTrue(h.dispatch("movetoworkspace -1"))
+        self.assertEqual(tried, [['"movetoworkspace", "-1"']])  # straight to the known form
+
+    def test_nothing_works(self):
+        self.assertFalse(tv.Hypr(lambda cmd: None).dispatch("workspace +1"))
 
 
 class ConfigTests(unittest.TestCase):

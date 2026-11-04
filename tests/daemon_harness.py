@@ -120,6 +120,8 @@ tv.Session.__init__.__defaults__ = (lambda cmd: SESSION_CALLS.append(cmd) or Tru
                                     lambda cfg: SESSION_CALLS.append("api-close") or True, False,
                                     lambda cmd: "VCP 10 C 55 100")
 tv.BRIGHTNESS_FILE = os.path.join(tmp, "brightness")
+with open(tv.BRIGHTNESS_FILE, "w") as f:   # as if the PC died while the monitor was dimmed
+    f.write("33")
 
 marks = {}
 FLAG_AFTER_END = []

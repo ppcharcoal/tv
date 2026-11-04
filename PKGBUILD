@@ -2,7 +2,7 @@
 # Build & install from a clone of this repo:  makepkg -si
 
 pkgname=tv-pad
-pkgver=1.4.0
+pkgver=1.5.0
 pkgrel=1
 pkgdesc="Control the Wayland desktop with a gamepad while Sunshine streams it to the TV"
 arch=('any')
