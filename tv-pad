@@ -24,7 +24,7 @@ import threading
 import time
 import urllib.request
 
-VERSION = "1.5.0"
+VERSION = "1.5.1"
 APP = "tv-pad"
 
 RUNTIME_DIR = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
@@ -68,7 +68,8 @@ DEFAULT_CONFIG = {
     #   "mouse:LEFT"  hold a mouse button (LEFT, RIGHT, MIDDLE, SIDE, EXTRA)
     #   "osk"         show/hide the on-screen keyboard
     #   "cmd:..."     run a shell command when pressed
-    #   "hypr:..."    Hyprland dispatcher, e.g. "hypr:workspace +1" (old and Lua hyprctl syntax)
+    #   "hypr:..."    Hyprland dispatcher, e.g. "hypr:workspace +1" (translated for a Lua config),
+    #                 or "hypr:lua:hl.dsp.focus({ workspace = \"e+1\" })" sent as it is
     #   "screen"      turn the PC monitor off / on (the stream keeps running)
     #   "end-stream"  end the stream, turn the monitor back on, stop pad control
     #   "none"
@@ -593,14 +594,30 @@ BRIGHTNESS_FILE = os.path.join(PERSIST_DIR, "brightness")
 DEFAULT_BRIGHTNESS = 100  # used when the level before dimming is unknown
 
 
+def lua_string(value):
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+# Classic dispatcher -> Lua-config dispatcher (Hyprland with hyprland.lua; `hyprctl dispatch X`
+# runs `hl.dispatch(X)` there).
+LUA_DISPATCHERS = {
+    "workspace": lambda a: f"hl.dsp.focus({{ workspace = {lua_string(a)} }})",
+    "movetoworkspace": lambda a: f"hl.dsp.window.move({{ workspace = {lua_string(a)}, follow = true }})",
+    "movetoworkspacesilent": lambda a: f"hl.dsp.window.move({{ workspace = {lua_string(a)}, follow = false }})",
+    "killactive": lambda a: "hl.dsp.window.close()",
+}
+
+
 def hypr_dispatch_forms(command):
-    """The ways to send a dispatcher with hyprctl: classic syntax first, then the Lua-config
-    syntax (`hyprctl dispatch` wraps the argument in hl.dispatch(...))."""
+    """hyprctl commands to try for a dispatcher: the classic syntax, then the Lua-config one.
+    "lua:<expression>" sends the expression as it is (Lua config only)."""
+    if command.startswith("lua:"):
+        return [["hyprctl", "dispatch", command[4:].strip()]]
     dispatcher, _, args = command.partition(" ")
-    lua = lambda v: '"' + v.replace("\\", "\\\\").replace('"', '\\"') + '"'
-    forms = [["hyprctl", "dispatch", dispatcher] + ([args] if args else [])]
-    forms.append(["hyprctl", "dispatch", f"{lua(dispatcher)}, {lua(args)}" if args else lua(dispatcher)])
-    forms.append(["hyprctl", "dispatch", lua(command)])
+    forms = [["hyprctl", "dispatch", dispatcher] + ([args.strip()] if args.strip() else [])]
+    to_lua = LUA_DISPATCHERS.get(dispatcher)
+    if to_lua:
+        forms.append(["hyprctl", "dispatch", to_lua(args.strip())])
     return forms
 
 
@@ -613,7 +630,10 @@ class Hypr:
 
     def dispatch(self, command):
         forms = hypr_dispatch_forms(command)
-        order = [self.form] + [i for i in range(len(forms)) if i != self.form] if self.form is not None else range(len(forms))
+        order = list(range(len(forms)))
+        if self.form is not None and self.form < len(forms):
+            order.remove(self.form)
+            order.insert(0, self.form)
         for i in order:
             out = self.query(forms[i])
             if out is not None and out.strip().lower() == "ok":

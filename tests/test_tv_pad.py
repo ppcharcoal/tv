@@ -491,24 +491,38 @@ class HyprTests(unittest.TestCase):
     def test_forms(self):
         self.assertEqual(tv.hypr_dispatch_forms("workspace +1"), [
             ["hyprctl", "dispatch", "workspace", "+1"],
-            ["hyprctl", "dispatch", '"workspace", "+1"'],
-            ["hyprctl", "dispatch", '"workspace +1"'],
+            ["hyprctl", "dispatch", 'hl.dsp.focus({ workspace = "+1" })'],
         ])
+        self.assertEqual(tv.hypr_dispatch_forms("movetoworkspace -1")[1],
+                         ["hyprctl", "dispatch", 'hl.dsp.window.move({ workspace = "-1", follow = true })'])
+        self.assertEqual(tv.hypr_dispatch_forms("killactive")[1], ["hyprctl", "dispatch", "hl.dsp.window.close()"])
+        self.assertEqual(tv.hypr_dispatch_forms("exec foo"), [["hyprctl", "dispatch", "exec", "foo"]])
+        self.assertEqual(tv.hypr_dispatch_forms('lua:hl.dsp.focus({ workspace = "e+1" })'),
+                         [["hyprctl", "dispatch", 'hl.dsp.focus({ workspace = "e+1" })']])
+
+    def test_parse_lua_action(self):
+        a = tv.parse_action('hypr:lua:hl.dsp.focus({ workspace = "e+1" })', e)
+        self.assertEqual(a, tv.Action("hypr", command='lua:hl.dsp.focus({ workspace = "e+1" })'))
 
     def test_finds_working_syntax_and_remembers_it(self):
         tried = []
 
         def query(cmd):
             tried.append(cmd[2:])
-            # a Lua-config Hyprland: only the two-argument Lua form says "ok"
-            return "ok\n" if cmd[2] == '"workspace", "+1"' or cmd[2] == '"movetoworkspace", "-1"' else "error: 3 ..."
+            # a Lua-config Hyprland: only hl.dsp... says "ok"
+            return "ok\n" if cmd[2].startswith("hl.dsp.") else "error: 3 ..."
 
         h = tv.Hypr(query)
         self.assertTrue(h.dispatch("workspace +1"))
         self.assertEqual(len(tried), 2)
         tried.clear()
         self.assertTrue(h.dispatch("movetoworkspace -1"))
-        self.assertEqual(tried, [['"movetoworkspace", "-1"']])  # straight to the known form
+        self.assertEqual(tried, [['hl.dsp.window.move({ workspace = "-1", follow = true })']])
+
+    def test_remembered_form_missing_for_other_dispatcher(self):
+        h = tv.Hypr(lambda cmd: "ok" if cmd[2].startswith("hl.dsp.") or cmd[2] == "exec" else "error")
+        self.assertTrue(h.dispatch("workspace +1"))   # remembers the Lua form (index 1)
+        self.assertTrue(h.dispatch("exec foo"))       # has only the classic form
 
     def test_nothing_works(self):
         self.assertFalse(tv.Hypr(lambda cmd: None).dispatch("workspace +1"))
