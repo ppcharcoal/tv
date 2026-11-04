@@ -1,0 +1,834 @@
+#!/usr/bin/env python3
+"""tv-pad: control the Linux desktop with a gamepad while Sunshine streams it to the TV.
+
+Left stick moves the mouse, right stick scrolls, triggers click, face buttons send keys.
+It only acts while a stream is running (Sunshine calls `tv-pad on` / `tv-pad off`)
+and steps aside while a game (or Xbox Play) has focus.
+"""
+
+import argparse
+import functools
+import json
+import math
+import os
+import re
+import selectors
+import shutil
+import signal
+import subprocess
+import sys
+import time
+
+VERSION = "1.0.0"
+APP = "tv-pad"
+
+RUNTIME_DIR = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+STATE_DIR = os.path.join(RUNTIME_DIR, APP)
+ACTIVE_FLAG = os.path.join(STATE_DIR, "active")
+CONFIG_HOME = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+CONFIG_PATH = os.path.join(CONFIG_HOME, APP, "config.json")
+SUNSHINE_CONF = os.path.join(CONFIG_HOME, "sunshine", "sunshine.conf")
+
+# ----------------------------------------------------------------------------- config
+
+DEFAULT_CONFIG = {
+    # Mouse (left stick)
+    "mouse_speed": 1500,        # pixels per second at full tilt
+    "mouse_boost": 2.0,         # extra speed after holding full tilt for a moment
+    "mouse_curve": 2.2,         # >1 = fine control near the centre
+    "deadzone": 0.14,
+    # Scroll (right stick)
+    "scroll_speed": 22,         # wheel notches per second at full tilt
+    "scroll_curve": 1.6,
+    # The Linux xpad driver reports the X button as BTN_X and Y as BTN_Y; some drivers
+    # report them the other way round. If X and Y seem swapped, set this to true.
+    "swap_xy": False,
+    # Windows (Hyprland class, regex) that get the pad themselves: tv-pad pauses for them.
+    "pause_for_windows": [
+        "^xbox-play$", "^steam_app_", "^gamescope$", "^steam$", "^Moonlight$",
+        "^com\\.moonlight_stream", "^org\\.libretro\\.RetroArch$", "^retroarch$",
+    ],
+    # On-screen keyboard. The first "osk" press starts it (visible), later presses hide/show it
+    # (SIGRTMIN, as wvkbd understands). It is closed when the stream ends.
+    "osk_command": ["wvkbd-mobintl"],
+    # What each pad control does. Actions:
+    #   "key:A+B"     press keys together (names from linux/input-event-codes.h without KEY_)
+    #   "mouse:LEFT"  hold a mouse button (LEFT, RIGHT, MIDDLE, SIDE, EXTRA)
+    #   "osk"         show/hide the on-screen keyboard
+    #   "cmd:..."     run a shell command when pressed
+    #   "none"
+    "buttons": {
+        "A": "key:ENTER",
+        "B": "key:ESC",
+        "X": "osk",
+        "Y": "key:LEFTMETA+R",
+        "LB": "key:LEFTALT+LEFT",
+        "RB": "key:LEFTALT+RIGHT",
+        "LT": "mouse:RIGHT",
+        "RT": "mouse:LEFT",
+        "L3": "mouse:MIDDLE",
+        "R3": "none",
+        "View": "key:LEFTALT+TAB",
+        "Start": "none",
+        "Xbox": "none",
+        "Up": "key:UP",
+        "Down": "key:DOWN",
+        "Left": "key:LEFT",
+        "Right": "key:RIGHT",
+    },
+    # Hold the first control and press the second.
+    "combos": {
+        "Start+B": "key:LEFTMETA+C",
+    },
+    # Hold this control for a second to pause / resume desktop control.
+    "pause_hold": "Xbox",
+    "notifications": True,
+}
+
+CONTROLS = ["A", "B", "X", "Y", "LB", "RB", "LT", "RT", "L3", "R3",
+            "View", "Start", "Xbox", "Up", "Down", "Left", "Right"]
+
+
+def merge_config(user):
+    cfg = json.loads(json.dumps(DEFAULT_CONFIG))
+    if not isinstance(user, dict):
+        return cfg
+    for key, value in user.items():
+        if key not in cfg:
+            continue
+        if key in ("buttons", "combos") and isinstance(value, dict):
+            cfg[key].update({k: v for k, v in value.items() if isinstance(v, str)})
+        elif isinstance(cfg[key], bool):
+            cfg[key] = bool(value)
+        elif isinstance(cfg[key], (int, float)) and isinstance(value, (int, float)) and not isinstance(value, bool):
+            cfg[key] = float(value)
+        elif isinstance(cfg[key], list) and isinstance(value, list):
+            cfg[key] = [str(v) for v in value]
+        elif isinstance(cfg[key], str) and isinstance(value, str):
+            cfg[key] = value
+    return cfg
+
+
+def load_config():
+    try:
+        with open(CONFIG_PATH, encoding="utf-8") as f:
+            return merge_config(json.load(f))
+    except FileNotFoundError:
+        return merge_config(None)
+    except (OSError, ValueError) as err:
+        log(f"cannot read {CONFIG_PATH}: {err} (using defaults)")
+        return merge_config(None)
+
+
+def log(msg):
+    print(f"[{APP}] {msg}", file=sys.stderr, flush=True)
+
+
+# ----------------------------------------------------------------------------- actions
+
+class Action:
+    """A parsed action string. kind: key | mouse | osk | cmd | none."""
+
+    __slots__ = ("kind", "codes", "command")
+
+    def __init__(self, kind, codes=(), command=""):
+        self.kind, self.codes, self.command = kind, tuple(codes), command
+
+    def __eq__(self, other):
+        return isinstance(other, Action) and (self.kind, self.codes, self.command) == (other.kind, other.codes, other.command)
+
+    def __repr__(self):
+        return f"Action({self.kind}, {self.codes}, {self.command!r})"
+
+
+MOUSE_BUTTONS = {"LEFT": "BTN_LEFT", "RIGHT": "BTN_RIGHT", "MIDDLE": "BTN_MIDDLE",
+                 "SIDE": "BTN_SIDE", "EXTRA": "BTN_EXTRA"}
+
+
+def parse_action(text, ecodes):
+    text = (text or "none").strip()
+    if text == "none":
+        return Action("none")
+    if text == "osk":
+        return Action("osk")
+    if text.startswith("cmd:"):
+        return Action("cmd", command=text[4:].strip())
+    if text.startswith("mouse:"):
+        name = MOUSE_BUTTONS.get(text[6:].strip().upper())
+        if not name:
+            raise ValueError(f"unknown mouse button in {text!r}")
+        return Action("mouse", [getattr(ecodes, name)])
+    if text.startswith("key:"):
+        codes = []
+        for part in text[4:].split("+"):
+            name = "KEY_" + part.strip().upper()
+            if not hasattr(ecodes, name):
+                raise ValueError(f"unknown key {part!r} in {text!r}")
+            codes.append(getattr(ecodes, name))
+        return Action("key", codes)
+    raise ValueError(f"unknown action {text!r}")
+
+
+# ----------------------------------------------------------------------------- pad -> desktop
+
+def stick_magnitude(x, y, deadzone, curve):
+    """Return (unit_x, unit_y, strength 0..1) for a stick position."""
+    m = math.hypot(x, y)
+    if m <= deadzone:
+        return 0.0, 0.0, 0.0
+    n = min(1.0, (m - deadzone) / (1.0 - deadzone))
+    return x / m, y / m, n ** curve
+
+
+class Mapper:
+    """Turns pad state into desktop input. `out` must provide:
+    key(code, down), rel(code, value), syn(), osk_toggle(), run(cmd), notify(text)."""
+
+    def __init__(self, cfg, ecodes, out):
+        self.cfg, self.e, self.out = cfg, ecodes, out
+        self.buttons = {name: parse_action(cfg["buttons"].get(name, "none"), ecodes) for name in CONTROLS}
+        self.combos = {}
+        for combo, action in cfg["combos"].items():
+            mod, _, btn = combo.partition("+")
+            if mod in CONTROLS and btn in CONTROLS:
+                self.combos[(mod, btn)] = parse_action(action, ecodes)
+        self.modifiers = {mod for mod, _ in self.combos}
+        self.reset()
+
+    def reset(self):
+        self.held = {}             # control -> Action currently held down
+        self.down = set()          # controls physically down
+        self.mod_used = set()      # modifiers that took part in a combo while held
+        self.pressed_keys = {}     # code -> count (so overlapping actions do not release early)
+        self.lx = self.ly = self.rx = self.ry = 0.0
+        self.mouse_acc = [0.0, 0.0]
+        self.scroll_acc = [0.0, 0.0]
+        self.hires_acc = [0.0, 0.0]
+        self.full_tilt_for = 0.0
+        self.pause_since = None
+
+    # --- low level output, with reference counting for keys
+    def _press(self, action):
+        if action.kind in ("key", "mouse"):
+            for code in action.codes:
+                n = self.pressed_keys.get(code, 0)
+                self.pressed_keys[code] = n + 1
+                if n == 0:
+                    self.out.key(code, True)
+            self.out.syn()
+        elif action.kind == "osk":
+            self.out.osk_toggle()
+        elif action.kind == "cmd" and action.command:
+            self.out.run(action.command)
+
+    def _release(self, action):
+        if action.kind in ("key", "mouse"):
+            for code in reversed(action.codes):
+                n = self.pressed_keys.get(code, 0)
+                if n <= 1:
+                    self.pressed_keys.pop(code, None)
+                    if n == 1:
+                        self.out.key(code, False)
+                else:
+                    self.pressed_keys[code] = n - 1
+            self.out.syn()
+
+    def release_all(self):
+        for action in list(self.held.values()):
+            self._release(action)
+        for code in list(self.pressed_keys):
+            self.out.key(code, False)
+        if self.pressed_keys:
+            self.out.syn()
+        self.reset()
+
+    # --- controls
+    def control(self, name, pressed):
+        if pressed:
+            if name in self.down:
+                return
+            self.down.add(name)
+            if name == self.cfg.get("pause_hold"):
+                self.pause_since = time.monotonic()
+            combo = next((self.combos[(m, name)] for m in self.down if (m, name) in self.combos and m != name), None)
+            if combo is not None:
+                for m in self.down:
+                    if (m, name) in self.combos:
+                        self.mod_used.add(m)
+                self.held[name] = combo
+                self._press(combo)
+            elif name in self.modifiers:
+                pass  # its own action fires on release if no combo was used
+            else:
+                action = self.buttons[name]
+                self.held[name] = action
+                self._press(action)
+        else:
+            if name not in self.down:
+                return
+            self.down.discard(name)
+            if name == self.cfg.get("pause_hold"):
+                self.pause_since = None
+            if name in self.held:
+                self._release(self.held.pop(name))
+            elif name in self.modifiers and name not in self.mod_used:
+                action = self.buttons[name]  # tap of a modifier: press and release its own action
+                self._press(action)
+                self._release(action)
+            self.mod_used.discard(name)
+
+    def pause_requested(self, now):
+        """True once the pause control has been held for a second (then resets)."""
+        if self.pause_since is not None and now - self.pause_since >= 1.0:
+            self.pause_since = None
+            return True
+        return False
+
+    # --- sticks, called every frame
+    def tick(self, dt):
+        cfg, e = self.cfg, self.e
+        moved = False
+        # mouse
+        ux, uy, s = stick_magnitude(self.lx, self.ly, cfg["deadzone"], cfg["mouse_curve"])
+        if s > 0:
+            self.full_tilt_for = self.full_tilt_for + dt if s > 0.9 else 0.0
+            boost = 1.0 + (cfg["mouse_boost"] - 1.0) * min(1.0, max(0.0, (self.full_tilt_for - 0.35) / 0.6))
+            speed = cfg["mouse_speed"] * s * boost
+            for i, u in enumerate((ux, uy)):
+                self.mouse_acc[i] += u * speed * dt
+            dx, dy = int(self.mouse_acc[0]), int(self.mouse_acc[1])
+            self.mouse_acc[0] -= dx
+            self.mouse_acc[1] -= dy
+            if dx:
+                self.out.rel(e.REL_X, dx)
+                moved = True
+            if dy:
+                self.out.rel(e.REL_Y, dy)
+                moved = True
+        else:
+            self.full_tilt_for = 0.0
+            self.mouse_acc = [0.0, 0.0]
+        # scroll: stick up = scroll up (positive wheel), stick right = scroll right
+        ux, uy, s = stick_magnitude(self.rx, self.ry, cfg["deadzone"], cfg["scroll_curve"])
+        if s > 0:
+            notches = cfg["scroll_speed"] * s * dt
+            for i, (u, sign) in enumerate(((ux, 1), (uy, -1))):
+                units = u * sign * notches * 120
+                self.hires_acc[i] += units
+                self.scroll_acc[i] += units
+            hx, hy = int(self.hires_acc[0]), int(self.hires_acc[1])
+            self.hires_acc[0] -= hx
+            self.hires_acc[1] -= hy
+            if hy:
+                self.out.rel(e.REL_WHEEL_HI_RES, hy)
+                moved = True
+            if hx:
+                self.out.rel(e.REL_HWHEEL_HI_RES, hx)
+                moved = True
+            for i, code in ((1, e.REL_WHEEL), (0, e.REL_HWHEEL)):
+                while abs(self.scroll_acc[i]) >= 120:
+                    step = 1 if self.scroll_acc[i] > 0 else -1
+                    self.scroll_acc[i] -= 120 * step
+                    self.out.rel(code, step)
+                    moved = True
+        else:
+            self.scroll_acc = [0.0, 0.0]
+            self.hires_acc = [0.0, 0.0]
+        if moved:
+            self.out.syn()
+        return moved
+
+
+# ----------------------------------------------------------------------------- reading pads
+
+@functools.lru_cache(maxsize=4)
+def button_names(e, swap_xy):
+    return {
+        e.BTN_SOUTH: "A", e.BTN_EAST: "B",
+        e.BTN_X: "Y" if swap_xy else "X", e.BTN_Y: "X" if swap_xy else "Y",
+        e.BTN_TL: "LB", e.BTN_TR: "RB", e.BTN_TL2: "LT", e.BTN_TR2: "RT",
+        e.BTN_THUMBL: "L3", e.BTN_THUMBR: "R3",
+        e.BTN_SELECT: "View", e.BTN_START: "Start", e.BTN_MODE: "Xbox",
+        e.BTN_DPAD_UP: "Up", e.BTN_DPAD_DOWN: "Down", e.BTN_DPAD_LEFT: "Left", e.BTN_DPAD_RIGHT: "Right",
+    }
+
+
+def pad_event_to_controls(event_type, code, value, e, swap_xy):
+    """Map one evdev event to [(control, pressed)] and/or axis updates [(axis, value)].
+    Axis values here are raw; the caller normalises them."""
+    if event_type == e.EV_KEY:
+        name = button_names(e, swap_xy).get(code)
+        if name and value in (0, 1):
+            return [(name, value == 1)], []
+        return [], []
+    if event_type == e.EV_ABS:
+        return [], [(code, value)]
+    return [], []
+
+
+class PadState:
+    """Normalises one pad's axes and turns triggers / hat into button presses."""
+
+    def __init__(self, absinfo, e):
+        self.e = e
+        self.info = absinfo  # code -> (min, max)
+        self.trigger_down = {"LT": False, "RT": False}
+        self.hat = {"x": 0, "y": 0}
+
+    def norm_stick(self, code, value):
+        lo, hi = self.info.get(code, (-32768, 32767))
+        if hi == lo:
+            return 0.0
+        return max(-1.0, min(1.0, (2.0 * (value - lo) / (hi - lo)) - 1.0))
+
+    def norm_trigger(self, code, value):
+        lo, hi = self.info.get(code, (0, 1023))
+        return 0.0 if hi == lo else max(0.0, min(1.0, (value - lo) / (hi - lo)))
+
+    def axis(self, code, value, mapper):
+        e = self.e
+        if code == e.ABS_X:
+            mapper.lx = self.norm_stick(code, value)
+        elif code == e.ABS_Y:
+            mapper.ly = self.norm_stick(code, value)
+        elif code == e.ABS_RX:
+            mapper.rx = self.norm_stick(code, value)
+        elif code == e.ABS_RY:
+            mapper.ry = self.norm_stick(code, value)
+        elif code in (e.ABS_Z, e.ABS_RZ, e.ABS_BRAKE, e.ABS_GAS):
+            name = "LT" if code in (e.ABS_Z, e.ABS_BRAKE) else "RT"
+            v = self.norm_trigger(code, value)
+            down = self.trigger_down[name]
+            if not down and v > 0.55:
+                self.trigger_down[name] = True
+                mapper.control(name, True)
+            elif down and v < 0.35:
+                self.trigger_down[name] = False
+                mapper.control(name, False)
+        elif code == e.ABS_HAT0X:
+            self._hat("x", value, "Left", "Right", mapper)
+        elif code == e.ABS_HAT0Y:
+            self._hat("y", value, "Up", "Down", mapper)
+
+    def _hat(self, axis, value, neg, pos, mapper):
+        value = (value > 0) - (value < 0)
+        old = self.hat[axis]
+        if old == value:
+            return
+        if old:
+            mapper.control(neg if old < 0 else pos, False)
+        if value:
+            mapper.control(neg if value < 0 else pos, True)
+        self.hat[axis] = value
+
+
+def is_gamepad(dev, e):
+    caps = dev.capabilities(absinfo=False)
+    keys = set(caps.get(e.EV_KEY, []))
+    axes = set(caps.get(e.EV_ABS, []))
+    return e.BTN_SOUTH in keys and e.ABS_X in axes and not dev.name.startswith(APP)
+
+
+# ----------------------------------------------------------------------------- environment
+
+def sunshine_running():
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            with open(f"/proc/{pid}/comm", encoding="utf-8") as f:
+                if f.read().strip() == "sunshine":
+                    return True
+        except OSError:
+            continue
+    return False
+
+
+def focused_window_class():
+    if not shutil.which("hyprctl") or not os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"):
+        return ""
+    try:
+        out = subprocess.run(["hyprctl", "-j", "activewindow"], capture_output=True, text=True, timeout=1)
+        data = json.loads(out.stdout or "{}")
+        return str(data.get("class") or data.get("initialClass") or "")
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return ""
+
+
+def notify(text, enabled=True):
+    log(text)
+    if enabled and shutil.which("notify-send"):
+        subprocess.Popen(["notify-send", "-a", "tv-pad", "-t", "2500", "Pad", text],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+# ----------------------------------------------------------------------------- daemon
+
+class Desktop:
+    """uinput keyboard + mouse, the on-screen keyboard, commands and notifications."""
+
+    def __init__(self, cfg, evdev, mapper_keys):
+        e = evdev.ecodes
+        self.cfg, self.e = cfg, e
+        mouse_keys = [e.BTN_LEFT, e.BTN_RIGHT, e.BTN_MIDDLE, e.BTN_SIDE, e.BTN_EXTRA]
+        self.mouse = evdev.UInput(
+            {e.EV_KEY: mouse_keys,
+             e.EV_REL: [e.REL_X, e.REL_Y, e.REL_WHEEL, e.REL_HWHEEL, e.REL_WHEEL_HI_RES, e.REL_HWHEEL_HI_RES]},
+            name=f"{APP} mouse")
+        keys = sorted(set(mapper_keys) - set(mouse_keys)) or [e.KEY_ENTER]
+        self.keyboard = evdev.UInput({e.EV_KEY: keys}, name=f"{APP} keyboard")
+        self.mouse_keys = set(mouse_keys)
+        self.osk = None
+        self._dirty = set()  # devices with events waiting for a SYN
+
+    def key(self, code, down):
+        dev = self.mouse if code in self.mouse_keys else self.keyboard
+        dev.write(self.e.EV_KEY, code, 1 if down else 0)
+        self._dirty.add(dev)
+
+    def rel(self, code, value):
+        self.mouse.write(self.e.EV_REL, code, value)
+        self._dirty.add(self.mouse)
+
+    def syn(self):
+        for dev in self._dirty:
+            dev.syn()
+        self._dirty.clear()
+
+    def osk_start(self):
+        cmd = self.cfg["osk_command"]
+        if self.osk and self.osk.poll() is None:
+            return
+        if not cmd or not shutil.which(cmd[0]):
+            self.osk = None
+            return
+        self.osk = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def osk_toggle(self):
+        if not self.osk or self.osk.poll() is not None:
+            self.osk_start()  # a fresh keyboard shows up by itself
+            if not self.osk:
+                notify("Brak klawiatury ekranowej: zainstaluj wvkbd (albo ustaw osk_command).", self.cfg["notifications"])
+            return
+        self.osk.send_signal(signal.SIGRTMIN)  # wvkbd: toggle visibility
+
+    def osk_stop(self):
+        if self.osk and self.osk.poll() is None:
+            self.osk.terminate()
+        self.osk = None
+
+    def run(self, command):
+        subprocess.Popen(["sh", "-c", command], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+
+    def notify(self, text):
+        notify(text, self.cfg["notifications"])
+
+    def close(self):
+        self.osk_stop()
+        self.mouse.close()
+        self.keyboard.close()
+
+
+def run_daemon():
+    import evdev  # imported here so `tv-pad on/off/status` work without python-evdev
+
+    e = evdev.ecodes
+    cfg = load_config()
+    try:
+        probe = Mapper(cfg, e, out=None)
+        pause_res = [re.compile(p) for p in cfg["pause_for_windows"]]
+    except (ValueError, re.error) as err:
+        notify(f"Błąd w {CONFIG_PATH}: {err}. Używam ustawień domyślnych.")
+        cfg = merge_config(None)
+        probe = Mapper(cfg, e, out=None)
+        pause_res = [re.compile(p) for p in cfg["pause_for_windows"]]
+
+    # Every key any action may press, so the virtual keyboard can send it.
+    all_codes = set()
+    for action in list(probe.buttons.values()) + list(probe.combos.values()):
+        all_codes.update(action.codes)
+
+    desktop = None
+    mapper = None
+    pads = {}          # path -> (InputDevice, PadState)
+    sel = selectors.DefaultSelector()
+    active = False     # stream running
+    paused = False     # user pause (Xbox hold) or a game has focus
+    user_paused = False
+    grabbed = False
+    last_scan = last_state = last_focus = 0.0
+    focus_pause = False
+    stop = False
+
+    def handle_signal(*_):
+        nonlocal stop
+        stop = True
+
+    signal.signal(signal.SIGTERM, handle_signal)
+    signal.signal(signal.SIGINT, handle_signal)
+
+    def set_grab(want):
+        nonlocal grabbed
+        if want == grabbed:
+            return
+        for dev, _ in pads.values():
+            try:
+                dev.grab() if want else dev.ungrab()
+            except OSError:
+                pass
+        grabbed = want
+
+    def scan():
+        for path in evdev.list_devices():
+            if path in pads:
+                continue
+            try:
+                dev = evdev.InputDevice(path)
+            except OSError:
+                continue
+            if not is_gamepad(dev, e):
+                dev.close()
+                continue
+            info = {code: (ai.min, ai.max) for code, ai in dev.capabilities(absinfo=True).get(e.EV_ABS, [])}
+            pads[path] = (dev, PadState(info, e))
+            sel.register(dev, selectors.EVENT_READ, path)
+            log(f"pad: {dev.name} ({path})")
+            if grabbed:
+                try:
+                    dev.grab()
+                except OSError:
+                    pass
+
+    def drop(path):
+        dev, _ = pads.pop(path)
+        try:
+            sel.unregister(dev)
+        except (KeyError, ValueError):
+            pass
+        try:
+            dev.close()
+        except OSError:
+            pass
+        log(f"pad gone: {path}")
+
+    log(f"started (version {VERSION}); waiting for a stream")
+    frame = 1 / 250
+    last_tick = time.monotonic()
+    while not stop:
+        now = time.monotonic()
+        if now - last_scan > 2.0:
+            scan()
+            last_scan = now
+        if now - last_state > 0.5:
+            last_state = now
+            want_active = os.path.exists(ACTIVE_FLAG) and sunshine_running()
+            if want_active != active:
+                active = want_active
+                user_paused = False
+                if active:
+                    if desktop is None:
+                        try:
+                            desktop = Desktop(cfg, evdev, all_codes)
+                        except OSError as err:
+                            log(f"cannot create virtual mouse/keyboard ({err}); is /dev/uinput accessible?")
+                            active = False
+                            continue
+                        mapper = Mapper(cfg, e, desktop)
+                    desktop.notify("Stream: pad steruje pulpitem")
+                else:
+                    if mapper:
+                        mapper.release_all()
+                    if desktop:
+                        desktop.osk_stop()
+                    log("stream ended")
+        if active and now - last_focus > 0.5:
+            last_focus = now
+            cls = focused_window_class()
+            fp = any(r.search(cls) for r in pause_res) if cls else False
+            if fp != focus_pause:
+                focus_pause = fp
+                log(f"{'pausing for' if fp else 'resuming after'} window {cls!r}")
+        want_paused = (not active) or user_paused or focus_pause
+        if want_paused != paused:
+            paused = want_paused
+            if paused and mapper:
+                mapper.release_all()
+        set_grab(active and not paused)
+
+        timeout = frame if (active and not paused) else 0.5
+        for key, _ in sel.select(timeout=timeout):
+            path = key.data
+            if path not in pads:
+                continue
+            dev, state = pads[path]
+            try:
+                events = list(dev.read())
+            except OSError:
+                drop(path)
+                continue
+            if not active or mapper is None:
+                continue
+            for ev in events:
+                controls, axes = pad_event_to_controls(ev.type, ev.code, ev.value, e, cfg["swap_xy"])
+                if paused:
+                    # while paused only watch the pause control
+                    for name, pressed in controls:
+                        if name == cfg["pause_hold"]:
+                            mapper.pause_since = now if pressed else None
+                    continue
+                for name, pressed in controls:
+                    mapper.control(name, pressed)
+                for code, value in axes:
+                    state.axis(code, value, mapper)
+        now = time.monotonic()
+        if active and mapper is not None and mapper.pause_requested(now):
+            user_paused = not user_paused
+            if user_paused:
+                mapper.release_all()
+            desktop.notify("Pad: pauza (przytrzymaj Xbox, żeby wrócić)" if user_paused else "Pad: steruje pulpitem")
+        if active and not paused and mapper is not None:
+            mapper.tick(min(0.05, now - last_tick))
+        last_tick = now
+
+    if mapper:
+        mapper.release_all()
+    set_grab(False)
+    if desktop:
+        desktop.close()
+    log("stopped")
+
+
+# ----------------------------------------------------------------------------- CLI helpers
+
+def cmd_on():
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(ACTIVE_FLAG, "w", encoding="utf-8") as f:
+        f.write(str(time.time()))
+
+
+def cmd_off():
+    try:
+        os.remove(ACTIVE_FLAG)
+    except FileNotFoundError:
+        pass
+
+
+def cmd_status():
+    flag = os.path.exists(ACTIVE_FLAG)
+    sun = sunshine_running()
+    print(f"stream flag: {'on' if flag else 'off'}")
+    print(f"sunshine:    {'running' if sun else 'not running'}")
+    print(f"active:      {'yes' if flag and sun else 'no'}")
+    print(f"config:      {CONFIG_PATH}{'' if os.path.exists(CONFIG_PATH) else ' (defaults, file not created)'}")
+
+
+def cmd_config():
+    if not os.path.exists(CONFIG_PATH):
+        os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(DEFAULT_CONFIG, f, indent=2, ensure_ascii=False)
+            f.write("\n")
+        print(f"created {CONFIG_PATH}")
+    else:
+        print(CONFIG_PATH)
+
+
+PREP_ENTRY = {"do": "/usr/bin/tv-pad on", "undo": "/usr/bin/tv-pad off"}
+
+
+def add_prep_cmd(conf_text):
+    """Return sunshine.conf text with our global_prep_cmd entry (unchanged if already there)."""
+    lines = conf_text.splitlines()
+    for i, line in enumerate(lines):
+        m = re.match(r"\s*global_prep_cmd\s*=\s*(.*)$", line)
+        if not m:
+            continue
+        try:
+            entries = json.loads(m.group(1) or "[]")
+        except ValueError:
+            raise ValueError("global_prep_cmd in sunshine.conf is not valid JSON; add the entry by hand")
+        if any(isinstance(x, dict) and "tv-pad" in str(x.get("do", "")) for x in entries):
+            return conf_text
+        entries.append(PREP_ENTRY)
+        lines[i] = "global_prep_cmd = " + json.dumps(entries)
+        return "\n".join(lines) + "\n"
+    return conf_text.rstrip("\n") + ("\n" if conf_text.strip() else "") + \
+        "global_prep_cmd = " + json.dumps([PREP_ENTRY]) + "\n"
+
+
+def cmd_setup_sunshine():
+    try:
+        with open(SUNSHINE_CONF, encoding="utf-8") as f:
+            text = f.read()
+    except FileNotFoundError:
+        text = ""
+    new = add_prep_cmd(text)
+    if new == text:
+        print(f"{SUNSHINE_CONF}: already set up")
+        return
+    os.makedirs(os.path.dirname(SUNSHINE_CONF), exist_ok=True)
+    if text:
+        with open(SUNSHINE_CONF + ".bak", "w", encoding="utf-8") as f:
+            f.write(text)
+    with open(SUNSHINE_CONF, "w", encoding="utf-8") as f:
+        f.write(new)
+    print(f"{SUNSHINE_CONF}: added global_prep_cmd (backup: sunshine.conf.bak)")
+    print("Restart Sunshine:  systemctl --user restart app-dev.lizardbyte.app.Sunshine.service")
+
+
+def cmd_test():
+    import evdev
+    e = evdev.ecodes
+    cfg = load_config()
+    pads = [evdev.InputDevice(p) for p in evdev.list_devices()]
+    pads = [d for d in pads if is_gamepad(d, e)]
+    if not pads:
+        print("No pad found. Connect it and try again.")
+        return
+    print("Press buttons on the pad (Ctrl+C to stop):")
+    for d in pads:
+        print(f"  {d.path}: {d.name}")
+    sel = selectors.DefaultSelector()
+    for d in pads:
+        sel.register(d, selectors.EVENT_READ)
+    try:
+        while True:
+            for key, _ in sel.select():
+                for ev in key.fileobj.read():
+                    controls, _ = pad_event_to_controls(ev.type, ev.code, ev.value, e, cfg["swap_xy"])
+                    for name, pressed in controls:
+                        if pressed:
+                            action = cfg["buttons"].get(name, "none")
+                            print(f"  {name:6} -> {action}")
+    except KeyboardInterrupt:
+        pass
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog=APP, description="Gamepad control of the desktop while streaming to the TV.")
+    parser.add_argument("command", nargs="?", default="run",
+                        choices=["run", "on", "off", "toggle", "status", "config", "setup-sunshine", "test", "version"])
+    args = parser.parse_args(argv)
+    if args.command == "run":
+        run_daemon()
+    elif args.command == "on":
+        cmd_on()
+    elif args.command == "off":
+        cmd_off()
+    elif args.command == "toggle":
+        cmd_off() if os.path.exists(ACTIVE_FLAG) else cmd_on()
+    elif args.command == "status":
+        cmd_status()
+    elif args.command == "config":
+        cmd_config()
+    elif args.command == "setup-sunshine":
+        cmd_setup_sunshine()
+    elif args.command == "test":
+        cmd_test()
+    elif args.command == "version":
+        print(VERSION)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,131 @@
+# tv-pad
+
+Sterowanie pulpitem Linuksa (Wayland, Hyprland) padem, gdy komputer jest streamowany na
+telewizor przez Sunshine i Moonlight. Lewa gałka to mysz, prawa gałka przewija, spusty
+klikają, przyciski wysyłają skróty klawiszowe.
+
+Działa **tylko podczas streamu**: Sunshine przy starcie streamu wywołuje `tv-pad on`, a przy
+końcu `tv-pad off`. Poza streamem program czeka i niczego nie dotyka. Gdy na pierwszym planie
+jest gra (Xbox Play, Steam, gamescope, RetroArch…), sam się wstrzymuje, żeby pad trafiał do gry.
+
+## Instalacja (Arch)
+
+```bash
+git clone https://github.com/ppcharcoal/tv && cd tv && makepkg -si
+systemctl --user enable --now tv-pad
+tv-pad setup-sunshine
+systemctl --user restart app-dev.lizardbyte.app.Sunshine.service
+```
+
+`tv-pad setup-sunshine` dopisuje do `~/.config/sunshine/sunshine.conf` (kopia zapasowa:
+`sunshine.conf.bak`):
+
+```ini
+global_prep_cmd = [{"do": "/usr/bin/tv-pad on", "undo": "/usr/bin/tv-pad off"}]
+```
+
+Klawiatura ekranowa (przycisk X), opcjonalnie:
+
+```bash
+sudo pacman -S wvkbd || (cd /tmp && git clone https://aur.archlinux.org/wvkbd-git.git && cd wvkbd-git && makepkg -si)
+```
+
+Aktualizacja:
+
+```bash
+cd tv && git pull && makepkg -si && systemctl --user restart tv-pad
+```
+
+## Sterowanie
+
+| Pad | Pulpit |
+|---|---|
+| lewa gałka | mysz (wolno przy lekkim wychyleniu, szybciej przy pełnym, przyspiesza po chwili) |
+| prawa gałka | przewijanie (góra/dół i na boki) |
+| RT | lewy przycisk myszy (przytrzymanie = przeciąganie) |
+| LT | prawy przycisk myszy |
+| L3 (wciśnięcie lewej gałki) | środkowy przycisk myszy |
+| A | Enter |
+| B | Esc |
+| X | klawiatura ekranowa (pokaż/ukryj) |
+| Y | Super+R (launcher aplikacji) |
+| View | Alt+Tab |
+| Start + B | Super+C (zamknij okno) |
+| LB / RB | Alt+← / Alt+→ (wstecz / dalej w przeglądarce) |
+| krzyżak | strzałki |
+| przytrzymaj Xbox 1 s | pauza / wznowienie sterowania pulpitem |
+
+Skróty Super+R i Super+C muszą być ustawione w Hyprlandzie (np. `bind = SUPER, R, exec, wofi --show drun`,
+`bind = SUPER, C, killactive`). Hyprland nie ma domyślnie Alt+Tab; przykład:
+
+```ini
+bind = ALT, TAB, cyclenext
+bind = ALT, TAB, bringactivetotop
+```
+
+## Ustawienia
+
+```bash
+tv-pad config        # tworzy ~/.config/tv-pad/config.json z ustawieniami domyślnymi
+systemctl --user restart tv-pad   # po zmianach
+```
+
+Najważniejsze opcje:
+
+| Opcja | Znaczenie |
+|---|---|
+| `mouse_speed` | piksele na sekundę przy pełnym wychyleniu (domyślnie 1500) |
+| `mouse_boost` | dodatkowe przyspieszenie po chwili pełnego wychylenia (2.0 = dwa razy szybciej) |
+| `mouse_curve` | czułość przy małym wychyleniu (większa = precyzyjniej) |
+| `scroll_speed` | ząbki kółka na sekundę przy pełnym wychyleniu |
+| `deadzone` | martwa strefa gałek (0.14) |
+| `swap_xy` | zamienia X i Y, jeśli sterownik pada zgłasza je odwrotnie |
+| `pause_for_windows` | klasy okien (regex), przy których program się wstrzymuje |
+| `osk_command` | klawiatura ekranowa (domyślnie `wvkbd-mobintl`) |
+| `buttons`, `combos` | co robi każdy przycisk i kombinacja |
+
+Akcje w `buttons` i `combos`:
+
+- `"key:LEFTMETA+R"`: klawisze naciśnięte razem (nazwy jak w `linux/input-event-codes.h`, bez `KEY_`),
+- `"mouse:LEFT"`: przycisk myszy (`LEFT`, `RIGHT`, `MIDDLE`, `SIDE`, `EXTRA`),
+- `"osk"`: klawiatura ekranowa,
+- `"cmd:polecenie"`: uruchomienie polecenia,
+- `"none"`: nic.
+
+Przykład: B jako „wstecz” w przeglądarce zamiast Esc i Start+A jako terminal:
+
+```json
+{
+  "buttons": { "B": "key:LEFTALT+LEFT" },
+  "combos": { "Start+A": "key:LEFTMETA+Q" }
+}
+```
+
+Przyciski pomylone? `tv-pad test` pokazuje, jak program widzi każdy naciśnięty przycisk.
+Jeśli X i Y są zamienione, ustaw `"swap_xy": true`.
+
+## Jak to działa i ograniczenia
+
+- Pad jest czytany z `/dev/input` (python-evdev), a mysz i klawiatura są wirtualne (uinput),
+  więc działa w każdym kompozytorze Wayland. Dostęp do `/dev/uinput` zapewnia ta sama reguła
+  udev co dla Sunshine.
+- Podczas sterowania pulpitem pad jest „przejęty” (inne programy go nie widzą). W pauzie
+  i w oknach z listy `pause_for_windows` jest oddawany.
+- Sunshine wywołuje `tv-pad off` dopiero po **zakończeniu** aplikacji w Moonlight. Samo
+  rozłączenie zostawia sesję i sterowanie aktywne; wtedy przytrzymaj Xbox, żeby wstrzymać,
+  albo zakończ sesję w Moonlight („Zakończ”).
+- Ręcznie: `tv-pad on`, `tv-pad off`, `tv-pad status`.
+- Log: `journalctl --user -u tv-pad -f`.
+
+## Testy
+
+```bash
+python -m unittest discover -s tests
+```
+
+Testy obejmują logikę przycisków, gałek i konfiguracji Sunshine, a także pełny przebieg demona
+na symulowanym padzie (start streamu, mysz, kliknięcia, pauza dla gry, koniec streamu).
+
+## Licencja
+
+MIT.

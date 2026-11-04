@@ -1,0 +1,13 @@
+[Unit]
+Description=tv-pad: control the desktop with a gamepad while streaming to the TV
+Documentation=https://github.com/ppcharcoal/tv
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+ExecStart=/usr/bin/tv-pad run
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=graphical-session.target
