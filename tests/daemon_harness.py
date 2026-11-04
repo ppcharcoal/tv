@@ -115,6 +115,9 @@ tv.focused_window_class = lambda: FOCUS[0]
 NOTES = []
 tv.notify = lambda text, enabled=True: NOTES.append(text)
 tv.load_config = lambda: tv.merge_config({"osk_command": []})
+SESSION_CALLS = []
+tv.Session.__init__.__defaults__ = (lambda cmd: SESSION_CALLS.append(cmd) or True,
+                                    lambda cfg: SESSION_CALLS.append("api-close") or True, False)
 
 marks = {}
 
@@ -177,7 +180,19 @@ def scenario():
     PAD.push(e.EV_KEY, e.BTN_SOUTH, 0)
     time.sleep(0.3)
     mark("stream_resumed")
-    os.remove(tv.ACTIVE_FLAG)                   # Sunshine: tv-pad off
+    PAD.push(e.EV_KEY, e.BTN_SELECT, 1)         # View + Left: end the stream from the pad
+    PAD.push(e.EV_ABS, e.ABS_HAT0X, -1)
+    PAD.push(e.EV_ABS, e.ABS_HAT0X, 0)
+    PAD.push(e.EV_KEY, e.BTN_SELECT, 0)
+    time.sleep(1.2)
+    mark("ended_by_pad")
+    PAD.push(e.EV_KEY, e.BTN_SOUTH, 1)
+    PAD.push(e.EV_KEY, e.BTN_SOUTH, 0)
+    time.sleep(0.3)
+    try:
+        os.remove(tv.ACTIVE_FLAG)               # Sunshine: tv-pad off (already gone)
+    except FileNotFoundError:
+        pass
     time.sleep(1.2)
     mark("stream_off")
     os.kill(os.getpid(), signal.SIGTERM)
@@ -185,4 +200,5 @@ def scenario():
 
 threading.Thread(target=scenario, daemon=True).start()
 tv.run_daemon()
-print(json.dumps({"log": LOG, "grabs": GRABS, "marks": marks, "notes": NOTES}))
+print(json.dumps({"log": LOG, "grabs": GRABS, "marks": marks, "notes": NOTES, "session": SESSION_CALLS,
+                  "flag_after_end": os.path.exists(tv.ACTIVE_FLAG)}))

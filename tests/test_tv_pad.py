@@ -32,6 +32,12 @@ class FakeOut:
     def osk_toggle(self):
         self.events.append(("osk",))
 
+    def screen_toggle(self):
+        self.events.append(("screen",))
+
+    def end_stream(self):
+        self.events.append(("end-stream",))
+
     def run(self, cmd):
         self.events.append(("run", cmd))
 
@@ -105,6 +111,28 @@ class ButtonTests(unittest.TestCase):
         self.assertEqual(out.keys().count((e.KEY_LEFTALT, True)), 1)
         self.assertEqual(out.keys()[-1], (e.KEY_LEFTALT, False))
 
+    def test_view_tap_is_alt_tab_and_view_combos(self):
+        m, out, _ = make()
+        m.control("View", True)
+        self.assertEqual(out.keys(), [])          # might become View+Up / View+Left
+        m.control("View", False)
+        self.assertEqual(out.keys(), [(e.KEY_LEFTALT, True), (e.KEY_TAB, True), (e.KEY_TAB, False), (e.KEY_LEFTALT, False)])
+        out.events.clear()
+        m.control("View", True)
+        m.control("Up", True)
+        m.control("Up", False)
+        m.control("View", False)
+        self.assertEqual(out.events, [("screen",)])  # no arrow key, no Alt+Tab
+        out.events.clear()
+        m.control("View", True)
+        m.control("Left", True)
+        m.control("Left", False)
+        m.control("View", False)
+        self.assertEqual(out.events, [("end-stream",)])
+        out.events.clear()
+        m.control("Up", True)                     # Up alone is still the arrow key
+        self.assertEqual(out.keys(), [(e.KEY_UP, True)])
+
     def test_osk_and_cmd(self):
         m, out, _ = make({"buttons": {"R3": "cmd:echo hi"}})
         m.control("X", True)
@@ -115,11 +143,11 @@ class ButtonTests(unittest.TestCase):
     def test_release_all(self):
         m, out, _ = make()
         m.control("RT", True)
-        m.control("View", True)
+        m.control("LB", True)
         out.events.clear()
         m.release_all()
         released = {code for code, down in out.keys() if not down}
-        self.assertEqual(released, {e.BTN_LEFT, e.KEY_LEFTALT, e.KEY_TAB})
+        self.assertEqual(released, {e.BTN_LEFT, e.KEY_LEFTALT, e.KEY_LEFT})
         self.assertEqual(m.held, {})
 
     def test_pause_hold(self):
@@ -260,6 +288,89 @@ class SunshineLogTests(unittest.TestCase):
         self.assertIs(self.w.poll(), True)
         self.write("[x]: Info: starting\n", mode="w")
         self.assertIsNone(self.w.poll())
+
+
+class SessionTests(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self.calls = []
+        self.flag = os.path.join(tempfile.mkdtemp(), "active")
+        open(self.flag, "w").close()
+        self.old_flag, tv.ACTIVE_FLAG = tv.ACTIVE_FLAG, self.flag
+        self.notes = []
+
+    def tearDown(self):
+        tv.ACTIVE_FLAG = self.old_flag
+
+    def session(self, api_ok):
+        cfg = tv.merge_config({})
+        return tv.Session(cfg, run=lambda cmd: self.calls.append(cmd) or True,
+                          close_app=lambda c: self.calls.append("api-close") or api_ok, background=False)
+
+    def test_screen_toggle_uses_ddc_and_restores(self):
+        s = self.session(True)
+        s.screen_toggle(self.notes.append)
+        s.screen_toggle(self.notes.append)
+        self.assertEqual(self.calls, [["ddcutil", "--noverify", "setvcp", "D6", "05"],
+                                      ["ddcutil", "--noverify", "setvcp", "D6", "01"]])
+        s.screen_on()  # already on: nothing to do
+        self.assertEqual(len(self.calls), 2)
+
+    def test_end_stream_turns_screen_on_and_closes_app(self):
+        s = self.session(True)
+        s.screen_toggle(self.notes.append)
+        self.calls.clear()
+        s.end_stream(self.notes.append)
+        self.assertEqual(self.calls, [["ddcutil", "--noverify", "setvcp", "D6", "01"], "api-close"])
+        self.assertFalse(os.path.exists(self.flag))
+
+    def test_end_stream_falls_back_to_restarting_sunshine(self):
+        s = self.session(False)
+        s.end_stream(self.notes.append)
+        self.assertEqual(self.calls, ["api-close",
+                                      ["systemctl", "--user", "restart", "app-dev.lizardbyte.app.Sunshine.service"]])
+
+    def test_api_needs_login(self):
+        self.assertFalse(tv.sunshine_close_app(tv.merge_config({})))
+
+
+class SunshineApiTests(unittest.TestCase):
+    """sunshine_close_app against a local HTTPS server that checks the request."""
+
+    def test_close_request(self):
+        import http.server
+        import ssl
+        import subprocess
+        import tempfile
+        import threading
+        d = tempfile.mkdtemp()
+        cert, key = os.path.join(d, "c.pem"), os.path.join(d, "k.pem")
+        subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", key, "-out", cert,
+                        "-days", "1", "-subj", "/CN=localhost"], check=True, capture_output=True)
+        seen = {}
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                seen["path"] = self.path
+                seen["auth"] = self.headers.get("Authorization")
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b'{"status":true}')
+
+            def log_message(self, *a):
+                pass
+
+        srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(cert, key)
+        srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
+        threading.Thread(target=srv.handle_request, daemon=True).start()
+        cfg = tv.merge_config({"sunshine_url": f"https://127.0.0.1:{srv.server_address[1]}",
+                               "sunshine_user": "pipes", "sunshine_password": "tajne"})
+        self.assertTrue(tv.sunshine_close_app(cfg))
+        self.assertEqual(seen["path"], "/api/apps/close")
+        self.assertEqual(seen["auth"], "Basic cGlwZXM6dGFqbmU=")  # base64("pipes:tajne")
+        srv.server_close()
 
 
 class ConfigTests(unittest.TestCase):

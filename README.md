@@ -49,7 +49,9 @@ cd tv && git pull && makepkg -si && systemctl --user restart tv-pad
 | B | Esc |
 | X | klawiatura ekranowa (pokaż/ukryj) |
 | Y | Super+R (launcher aplikacji) |
-| View | Alt+Tab |
+| View (krótko) | Alt+Tab |
+| **View + ↑** | wygaś / włącz monitor komputera (stream działa dalej) |
+| **View + ←** | zakończ stream: monitor wraca, sterowanie padem gaśnie |
 | Start + B | Super+C (zamknij okno) |
 | LB / RB | Alt+← / Alt+→ (wstecz / dalej w przeglądarce) |
 | krzyżak | strzałki |
@@ -62,6 +64,49 @@ Skróty Super+R i Super+C muszą być ustawione w Hyprlandzie (np. `bind = SUPER
 bind = ALT, TAB, cyclenext
 bind = ALT, TAB, bringactivetotop
 ```
+
+## Wygaszanie monitora (View + ↑)
+
+Hyprland po wyłączeniu wyjścia (`dpms off`) przestaje renderować, więc stream by zamarzł.
+Dlatego tv-pad usypia sam monitor przez DDC/CI (`ddcutil`), a karta graficzna dalej rysuje obraz
+dla Sunshine. Po zakończeniu lub wstrzymaniu streamu monitor jest włączany automatycznie.
+
+```bash
+sudo pacman -S ddcutil
+echo i2c-dev | sudo tee /etc/modules-load.d/i2c-dev.conf
+sudo modprobe i2c-dev
+ddcutil detect                      # powinien pokazać monitor
+ddcutil setvcp D6 05; sleep 3; ddcutil setvcp D6 01   # test: gaśnie i wraca
+```
+
+Jeśli `ddcutil` pisze o braku uprawnień do `/dev/i2c-*`:
+
+```bash
+sudo groupadd -f i2c && sudo usermod -aG i2c $USER
+echo 'KERNEL=="i2c-[0-9]*", GROUP="i2c", MODE="0660"' | sudo tee /etc/udev/rules.d/45-i2c.rules
+sudo udevadm control --reload-rules && sudo udevadm trigger   # potem wyloguj się i zaloguj
+```
+
+Jeśli monitor po uśpieniu nie budzi się przez DDC (trzeba wcisnąć przycisk), zamiast usypiania
+możesz ściemniać podświetlenie do zera; w `config.json`:
+
+```json
+"screen_off_command": ["ddcutil", "--noverify", "setvcp", "10", "0"],
+"screen_on_command":  ["ddcutil", "--noverify", "setvcp", "10", "70"]
+```
+
+## Kończenie streamu (View + ←)
+
+Najczyściej przez API Sunshine: wpisz login i hasło panelu Sunshine do `config.json`
+(`tv-pad config` tworzy plik):
+
+```json
+"sunshine_user": "twój_login",
+"sunshine_password": "twoje_hasło"
+```
+
+Bez tego tv-pad restartuje usługę Sunshine, co też kończy stream (Moonlight pokaże zerwane
+połączenie). W obu przypadkach monitor wraca, a sterowanie padem gaśnie od razu.
 
 ## Ustawienia
 

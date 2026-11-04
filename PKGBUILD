@@ -2,7 +2,7 @@
 # Build & install from a clone of this repo:  makepkg -si
 
 pkgname=tv-pad
-pkgver=1.1.0
+pkgver=1.2.0
 pkgrel=1
 pkgdesc="Control the Wayland desktop with a gamepad while Sunshine streams it to the TV"
 arch=('any')
@@ -12,6 +12,7 @@ depends=('python' 'python-evdev')
 optdepends=(
   'wvkbd: on-screen keyboard (X button); from the AUR as wvkbd-git if not in the repos'
   'libnotify: on-screen notifications'
+  'ddcutil: turning the PC monitor off during a stream (View + Up)'
   'hyprland: pausing automatically while a game window has focus'
 )
 checkdepends=('python-evdev')

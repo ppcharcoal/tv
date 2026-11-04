@@ -70,8 +70,17 @@ class DaemonTest(unittest.TestCase):
         grabs = self.r["grabs"][self.marks["stream_paused"][1]:self.marks["stream_resumed"][1]]
         self.assertEqual(grabs, ["grab"])
 
+    def test_view_left_ends_stream(self):
+        self.assertEqual(self.r["session"], ["api-close"])
+        self.assertFalse(self.r["flag_after_end"])
+        self.assertTrue(any("Kończę stream" in n for n in self.r["notes"]))
+        # neither the arrow key nor Alt+Tab went to the desktop, and the pad was let go
+        self.assertEqual(self.keys(self.between("stream_resumed", "ended_by_pad")), [])
+        grabs = self.r["grabs"][self.marks["stream_resumed"][1]:self.marks["ended_by_pad"][1]]
+        self.assertEqual(grabs, ["ungrab"])
+
     def test_stream_end(self):
-        self.assertEqual(self.keys(self.log[self.marks["stream_resumed"][0]:]), [])
+        self.assertEqual(self.keys(self.log[self.marks["ended_by_pad"][0]:]), [])
         self.assertEqual(self.r["grabs"][-1], "ungrab")
 
 
