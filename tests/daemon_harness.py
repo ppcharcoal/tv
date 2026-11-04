@@ -104,6 +104,7 @@ loader.exec_module(tv)
 
 tmp = tempfile.mkdtemp()
 tv.ACTIVE_FLAG = os.path.join(tmp, "active")
+tv.STATE_DIR = tmp
 tv.SUNSHINE_LOG = os.path.join(tmp, "sunshine.log")
 
 
@@ -185,6 +186,21 @@ def scenario():
     PAD.push(e.EV_KEY, e.BTN_SOUTH, 0)
     time.sleep(0.3)
     mark("stream_resumed")
+    import subprocess
+    game = subprocess.Popen(["sleep", "30"])     # a game started via tv-pad-game
+    open(os.path.join(tmp, f"game-{game.pid}"), "w").close()
+    time.sleep(1.2)
+    PAD.push(e.EV_KEY, e.BTN_SOUTH, 1)          # A goes to the game, not the desktop
+    PAD.push(e.EV_KEY, e.BTN_SOUTH, 0)
+    time.sleep(0.3)
+    mark("game_running")
+    game.kill()
+    game.wait()                                  # game closed (flag left behind: stale)
+    time.sleep(1.2)
+    PAD.push(e.EV_KEY, e.BTN_SOUTH, 1)          # desktop control is back
+    PAD.push(e.EV_KEY, e.BTN_SOUTH, 0)
+    time.sleep(0.3)
+    mark("game_closed")
     PAD.push(e.EV_KEY, e.BTN_SELECT, 1)         # View + Left: end the stream from the pad
     PAD.push(e.EV_ABS, e.ABS_HAT0X, -1)
     PAD.push(e.EV_ABS, e.ABS_HAT0X, 0)

@@ -528,6 +528,60 @@ class HyprTests(unittest.TestCase):
         self.assertFalse(tv.Hypr(lambda cmd: None).dispatch("workspace +1"))
 
 
+class GameWrapperTests(unittest.TestCase):
+    """tv-pad-game (shell) and games_running()."""
+
+    def setUp(self):
+        import tempfile
+        self.runtime = tempfile.mkdtemp()
+        self.dir = os.path.join(self.runtime, "tv-pad")
+        self.old = tv.STATE_DIR
+        tv.STATE_DIR = self.dir
+        self.script = os.path.join(HERE, "..", "tv-pad-game")
+
+    def tearDown(self):
+        tv.STATE_DIR = self.old
+
+    def run_wrapper(self, *cmd):
+        import subprocess
+        env = dict(os.environ, XDG_RUNTIME_DIR=self.runtime)
+        return subprocess.run(["sh", self.script, *cmd], capture_output=True, text=True, env=env, timeout=10)
+
+    def test_flag_exists_only_while_the_game_runs(self):
+        r = self.run_wrapper("sh", "-c", 'ls "$XDG_RUNTIME_DIR/tv-pad"; exit 7')
+        self.assertRegex(r.stdout, r"^game-\d+$")
+        self.assertEqual(r.returncode, 7)           # the game's exit code is passed on
+        self.assertEqual(os.listdir(self.dir), [])
+
+    def test_arguments_with_spaces_reach_the_game(self):
+        r = self.run_wrapper("printf", "%s|", "a b", "c")
+        self.assertEqual(r.stdout, "a b|c|")
+
+    def test_killed_wrapper_cleans_up(self):
+        import signal as sig
+        import subprocess
+        import time as t
+        env = dict(os.environ, XDG_RUNTIME_DIR=self.runtime)
+        p = subprocess.Popen(["sh", self.script, "sleep", "30"], env=env, start_new_session=True)
+        for _ in range(50):
+            if tv.games_running():
+                break
+            t.sleep(0.05)
+        self.assertEqual(tv.games_running(), [p.pid])
+        os.killpg(p.pid, sig.SIGTERM)  # like Steam stopping the game: the whole process group
+        p.wait(timeout=10)
+        self.assertEqual(os.listdir(self.dir), [])
+
+    def test_stale_flag_is_dropped(self):
+        os.makedirs(self.dir)
+        open(os.path.join(self.dir, "game-999999999"), "w").close()
+        self.assertEqual(tv.games_running(), [])
+        self.assertEqual(os.listdir(self.dir), [])
+
+    def test_no_arguments(self):
+        self.assertEqual(self.run_wrapper().returncode, 2)
+
+
 class ConfigTests(unittest.TestCase):
     def test_merge(self):
         cfg = tv.merge_config({"mouse_speed": 900, "swap_xy": 1, "buttons": {"A": "key:SPACE", "B": 5},

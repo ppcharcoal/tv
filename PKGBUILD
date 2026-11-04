@@ -2,7 +2,7 @@
 # Build & install from a clone of this repo:  makepkg -si
 
 pkgname=tv-pad
-pkgver=1.5.1
+pkgver=1.6.0
 pkgrel=1
 pkgdesc="Control the Wayland desktop with a gamepad while Sunshine streams it to the TV"
 arch=('any')
@@ -17,8 +17,8 @@ optdepends=(
 )
 checkdepends=('python-evdev')
 install=tv-pad.install
-source=('tv-pad' 'tv-pad.service' 'LICENSE')
-sha256sums=('SKIP' 'SKIP' 'SKIP')
+source=('tv-pad' 'tv-pad-game' 'tv-pad.service' 'LICENSE')
+sha256sums=('SKIP' 'SKIP' 'SKIP' 'SKIP')
 
 check() {
   # The tests live next to this PKGBUILD in the repo clone.
@@ -28,6 +28,7 @@ check() {
 
 package() {
   install -Dm755 tv-pad "$pkgdir/usr/bin/tv-pad"
+  install -Dm755 tv-pad-game "$pkgdir/usr/bin/tv-pad-game"
   install -Dm644 tv-pad.service "$pkgdir/usr/lib/systemd/user/tv-pad.service"
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }

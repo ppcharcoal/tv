@@ -24,7 +24,7 @@ import threading
 import time
 import urllib.request
 
-VERSION = "1.5.1"
+VERSION = "1.6.0"
 APP = "tv-pad"
 
 RUNTIME_DIR = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
@@ -55,10 +55,12 @@ DEFAULT_CONFIG = {
     "pause_for_windows": [
         "^xbox-play$", "^Moonlight$", "^com\\.moonlight_stream", "^org\\.libretro\\.RetroArch$", "^retroarch$",
     ],
-    # Steam: when Sunshine streams one of these apps (by its name in Sunshine) or one of these
-    # windows has focus, the pad stays with the game and only watch_only_combos work.
+    # Games: while a game started with `tv-pad-game` runs (Steam launch option
+    # "tv-pad-game %command%"), while Sunshine streams an app matching watch_only_apps, or
+    # while a window matching watch_only_windows has focus, the pad stays with the game and
+    # only watch_only_combos work. The Steam client window itself is normal desktop.
     "watch_only_apps": ["(?i)steam"],
-    "watch_only_windows": ["^steam$", "^steam_app_", "^gamescope$"],
+    "watch_only_windows": ["^steam_app_", "^gamescope$"],
     "watch_only_combos": {"View+Left": "end-stream"},
     # On-screen keyboard. The first "osk" press starts it (visible), later presses hide/show it
     # (SIGRTMIN, as wvkbd understands). It is closed when the stream ends.
@@ -879,6 +881,7 @@ def run_daemon():
     watch = False         # pad stays with the game (Steam), only the combos are watched
     stream_app = ""
     pause_window = watch_window = False
+    game = False          # a game started with tv-pad-game is running
     sunshine_log = SunshineLog(SUNSHINE_LOG)
     pads = {}          # path -> (InputDevice, PadState)
     sel = selectors.DefaultSelector()
@@ -985,6 +988,10 @@ def run_daemon():
                     log("stream paused" if os.path.exists(ACTIVE_FLAG) else "stream ended")
         if active and now - last_focus > 0.5:
             last_focus = now
+            g = bool(games_running())
+            if g != game:
+                game = g
+                log("game started (tv-pad-game)" if g else "game closed")
             cls = focused_window_class()
             ww = matches("watch_only_windows", cls)
             pw = matches("pause_for_windows", cls) and not ww
@@ -992,14 +999,14 @@ def run_daemon():
                 watch_window, pause_window = ww, pw
                 if ww or pw:
                     log(f"window {cls!r}: {'Steam, only View+Left' if ww else 'pausing'}")
-        want_watch = active and (matches("watch_only_apps", stream_app) or watch_window)
+        want_watch = active and (game or matches("watch_only_apps", stream_app) or watch_window)
         if want_watch != watch:
             watch = want_watch
             for m in (mapper, watch_mapper):
                 if m:
                     m.release_all()
-            if watch and desktop:
-                desktop.notify("Steam: pad steruje grą. View + ← kończy stream")
+            if desktop:
+                desktop.notify("Gra: pad steruje grą. View + ← kończy stream" if watch else "Pad steruje pulpitem")
         want_paused = (not active) or user_paused or (pause_window and not watch)
         if want_paused != paused:
             paused = want_paused
@@ -1069,6 +1076,28 @@ def cmd_on():
         json.dump({"app": os.environ.get("SUNSHINE_APP_NAME", ""), "since": time.time()}, f)
 
 
+def games_running():
+    """PIDs of games started through tv-pad-game that are still running (stale flags removed)."""
+    try:
+        names = os.listdir(STATE_DIR)
+    except OSError:
+        return []
+    alive = []
+    for name in names:
+        m = re.fullmatch(r"game-(\d+)", name)
+        if not m:
+            continue
+        pid = int(m.group(1))
+        if os.path.exists(f"/proc/{pid}"):
+            alive.append(pid)
+        else:  # the wrapper was killed without cleaning up
+            try:
+                os.remove(os.path.join(STATE_DIR, name))
+            except OSError:
+                pass
+    return alive
+
+
 def read_stream_app():
     """Name of the streamed Sunshine app, or "" if unknown."""
     try:
@@ -1105,6 +1134,8 @@ def cmd_status():
     print(f"client:      {client_text}")
     if flag:
         print(f"app:         {read_stream_app() or 'unknown'}")
+    games = games_running()
+    print(f"game:        {'running (pid ' + ', '.join(map(str, games)) + ')' if games else 'none'}")
     print(f"active:      {'yes' if flag and sun and client is not False else 'no'}")
     print(f"config:      {CONFIG_PATH}{'' if os.path.exists(CONFIG_PATH) else ' (defaults, file not created)'}")
 

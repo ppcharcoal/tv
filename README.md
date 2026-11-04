@@ -68,15 +68,27 @@ bind = ALT, TAB, cyclenext
 bind = ALT, TAB, bringactivetotop
 ```
 
-## Steam Big Picture
+## Gry
 
-Gdy Sunshine streamuje aplikację ze „Steam” w nazwie (np. „Steam Big Picture”) albo na
-pierwszym planie jest okno Steama lub gry ze Steama, pad zostaje w całości dla Steama:
-tv-pad nie steruje myszą ani klawiaturą, działa tylko **View + ←** (koniec streamu).
-Nazwę aplikacji przekazuje Sunshine (`SUNSHINE_APP_NAME`); `tv-pad status` pokazuje, co widzi.
+Na czas gry pad należy do gry: tv-pad niczego nie wysyła na pulpit i nie przejmuje pada,
+działa tylko **View + ←** (koniec streamu). Po zamknięciu gry sterowanie pulpitem wraca samo.
 
-Ustawienia: `watch_only_apps` (nazwy aplikacji w Sunshine), `watch_only_windows` (klasy okien),
-`watch_only_combos` (kombinacje, które wtedy działają).
+**Steam:** we właściwościach gry → *Opcje uruchamiania* wpisz:
+
+```
+tv-pad-game %command%
+```
+
+Jeśli gra ma już inne opcje, `tv-pad-game` dopisz na początku, np. `tv-pad-game gamemoderun %command%`.
+
+**Inne programy:** `tv-pad-game polecenie [argumenty]`.
+
+Okno klienta Steam to zwykły pulpit (można po nim klikać padem). Gry uruchomione bez
+`tv-pad-game` też są rozpoznawane po klasie okna (`steam_app_*`, `gamescope`), ale tylko gdy mają
+fokus. `tv-pad status` pokazuje, czy gra jest uruchomiona.
+
+Ustawienia: `watch_only_windows` (klasy okien gier), `watch_only_combos` (kombinacje, które działają
+w grze), `watch_only_apps` (aplikacje Sunshine traktowane jak gra).
 
 ## Wygaszanie monitora (View + ↑)
 

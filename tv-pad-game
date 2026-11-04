@@ -1,0 +1,29 @@
+#!/bin/sh
+# tv-pad-game: run a game so that tv-pad leaves the pad to it until the game exits.
+# Steam: Properties -> Launch options:   tv-pad-game %command%
+# Anything else:                         tv-pad-game <command> [args...]
+#
+# While the game runs, tv-pad sends nothing to the desktop and does not grab the pad
+# (only View + Left, "end stream", still works). A plain shell script on purpose: Steam
+# starts games with its own library paths, and /bin/sh is unaffected by them.
+
+if [ "$#" -eq 0 ]; then
+    echo "usage: tv-pad-game <command> [args...]   (Steam: tv-pad-game %command%)" >&2
+    exit 2
+fi
+
+dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/tv-pad"
+mkdir -p "$dir" 2>/dev/null
+flag="$dir/game-$$"
+: > "$flag" 2>/dev/null
+
+cleanup() { rm -f "$flag"; }
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
+trap 'cleanup; exit 129' HUP
+
+"$@"
+status=$?
+cleanup
+exit "$status"

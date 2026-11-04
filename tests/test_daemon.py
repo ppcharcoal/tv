@@ -78,9 +78,16 @@ class DaemonTest(unittest.TestCase):
         self.assertFalse(self.r["flag_after_end"])
         self.assertTrue(any("Kończę stream" in n for n in self.r["notes"]))
         # neither the arrow key nor Alt+Tab went to the desktop, and the pad was let go
-        self.assertEqual(self.keys(self.between("stream_resumed", "ended_by_pad")), [])
-        grabs = self.r["grabs"][self.marks["stream_resumed"][1]:self.marks["ended_by_pad"][1]]
+        self.assertEqual(self.keys(self.between("game_closed", "ended_by_pad")), [])
+        grabs = self.r["grabs"][self.marks["game_closed"][1]:self.marks["ended_by_pad"][1]]
         self.assertEqual(grabs, ["ungrab"])
+
+    def test_game_gets_the_pad_until_it_closes(self):
+        self.assertEqual(self.keys(self.between("stream_resumed", "game_running")), [])
+        self.assertIn("ungrab", self.r["grabs"][self.marks["stream_resumed"][1]:self.marks["game_running"][1]])
+        self.assertTrue(any(n.startswith("Gra:") for n in self.r["notes"]))
+        self.assertEqual(self.keys(self.between("game_running", "game_closed")), [(e.BTN_LEFT, 1), (e.BTN_LEFT, 0)])
+        self.assertIn("grab", self.r["grabs"][self.marks["game_running"][1]:self.marks["game_closed"][1]])
 
     def test_stream_end(self):
         self.assertEqual(self.keys(self.between("ended_by_pad", "before_steam")), [])
@@ -91,7 +98,7 @@ class DaemonTest(unittest.TestCase):
         self.assertEqual(steam, [], "no keys and no mouse movement on the desktop during a Steam stream")
         grabs = self.r["grabs"][self.marks["before_steam"][1]:self.marks["steam_done"][1]]
         self.assertNotIn("grab", grabs)
-        self.assertTrue(any("Steam" in n for n in self.r["notes"]))
+        self.assertGreaterEqual(sum(n.startswith("Gra:") for n in self.r["notes"]), 2)  # game + Steam stream
 
     def test_steam_stream_ends_with_view_left(self):
         self.assertEqual(self.r["session"][1:], ["api-close", "api-close"])
