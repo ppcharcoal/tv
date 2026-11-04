@@ -19,7 +19,7 @@ import subprocess
 import sys
 import time
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 APP = "tv-pad"
 
 RUNTIME_DIR = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
@@ -28,6 +28,7 @@ ACTIVE_FLAG = os.path.join(STATE_DIR, "active")
 CONFIG_HOME = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
 CONFIG_PATH = os.path.join(CONFIG_HOME, APP, "config.json")
 SUNSHINE_CONF = os.path.join(CONFIG_HOME, "sunshine", "sunshine.conf")
+SUNSHINE_LOG = os.path.join(CONFIG_HOME, "sunshine", "sunshine.log")
 
 # ----------------------------------------------------------------------------- config
 
@@ -431,6 +432,51 @@ def is_gamepad(dev, e):
 
 # ----------------------------------------------------------------------------- environment
 
+class SunshineLog:
+    """Follows sunshine.log to know whether a client is connected right now.
+
+    Sunshine only runs the prep "undo" command when the app is quit in Moonlight; turning
+    the TV off or leaving Moonlight just pauses the stream. The log tells the two apart.
+    state: True (client connected), False (disconnected / paused), None (nothing logged yet).
+    """
+
+    CONNECTED = re.compile(rb"client\s+connected", re.I)
+    DISCONNECTED = re.compile(rb"client\s+disconnected", re.I)
+
+    def __init__(self, path):
+        self.path = path
+        self.inode = None
+        self.offset = 0
+        self.rest = b""
+        self.state = None
+
+    def poll(self):
+        try:
+            st = os.stat(self.path)
+        except OSError:
+            return self.state
+        if st.st_ino != self.inode or st.st_size < self.offset:
+            # new or truncated log (Sunshine restarted): start over
+            self.inode, self.offset, self.rest, self.state = st.st_ino, 0, b"", None
+        if st.st_size == self.offset:
+            return self.state
+        try:
+            with open(self.path, "rb") as f:
+                f.seek(self.offset)
+                data = f.read(st.st_size - self.offset)
+        except OSError:
+            return self.state
+        self.offset += len(data)
+        lines = (self.rest + data).split(b"\n")
+        self.rest = lines.pop()
+        for line in lines:
+            if self.DISCONNECTED.search(line):
+                self.state = False
+            elif self.CONNECTED.search(line):
+                self.state = True
+        return self.state
+
+
 def sunshine_running():
     for pid in os.listdir("/proc"):
         if not pid.isdigit():
@@ -551,6 +597,7 @@ def run_daemon():
 
     desktop = None
     mapper = None
+    sunshine_log = SunshineLog(SUNSHINE_LOG)
     pads = {}          # path -> (InputDevice, PadState)
     sel = selectors.DefaultSelector()
     active = False     # stream running
@@ -622,7 +669,8 @@ def run_daemon():
             last_scan = now
         if now - last_state > 0.5:
             last_state = now
-            want_active = os.path.exists(ACTIVE_FLAG) and sunshine_running()
+            client = sunshine_log.poll()
+            want_active = os.path.exists(ACTIVE_FLAG) and client is not False and sunshine_running()
             if want_active != active:
                 active = want_active
                 user_paused = False
@@ -641,7 +689,7 @@ def run_daemon():
                         mapper.release_all()
                     if desktop:
                         desktop.osk_stop()
-                    log("stream ended")
+                    log("stream paused" if os.path.exists(ACTIVE_FLAG) else "stream ended")
         if active and now - last_focus > 0.5:
             last_focus = now
             cls = focused_window_class()
@@ -719,7 +767,10 @@ def cmd_status():
     sun = sunshine_running()
     print(f"stream flag: {'on' if flag else 'off'}")
     print(f"sunshine:    {'running' if sun else 'not running'}")
-    print(f"active:      {'yes' if flag and sun else 'no'}")
+    client = SunshineLog(SUNSHINE_LOG).poll()
+    client_text = {True: "connected", False: "disconnected (stream paused)", None: "unknown (no entry in sunshine.log)"}[client]
+    print(f"client:      {client_text}")
+    print(f"active:      {'yes' if flag and sun and client is not False else 'no'}")
     print(f"config:      {CONFIG_PATH}{'' if os.path.exists(CONFIG_PATH) else ' (defaults, file not created)'}")
 
 

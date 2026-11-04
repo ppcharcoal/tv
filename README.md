@@ -111,9 +111,10 @@ Jeśli X i Y są zamienione, ustaw `"swap_xy": true`.
   udev co dla Sunshine.
 - Podczas sterowania pulpitem pad jest „przejęty” (inne programy go nie widzą). W pauzie
   i w oknach z listy `pause_for_windows` jest oddawany.
-- Sunshine wywołuje `tv-pad off` dopiero po **zakończeniu** aplikacji w Moonlight. Samo
-  rozłączenie zostawia sesję i sterowanie aktywne; wtedy przytrzymaj Xbox, żeby wstrzymać,
-  albo zakończ sesję w Moonlight („Zakończ”).
+- Sunshine wywołuje `tv-pad off` dopiero po **zakończeniu** aplikacji w Moonlight. Gdy stream
+  jest tylko wstrzymany (wyłączony telewizor, wyjście z Moonlight), tv-pad rozpoznaje to po
+  wpisach „CLIENT DISCONNECTED” / „CLIENT CONNECTED” w `~/.config/sunshine/sunshine.log`
+  i oddaje pada, a po wznowieniu przejmuje go z powrotem. `tv-pad status` pokazuje, co widzi.
 - Ręcznie: `tv-pad on`, `tv-pad off`, `tv-pad status`.
 - Log: `journalctl --user -u tv-pad -f`.
 

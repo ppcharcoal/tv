@@ -225,6 +225,43 @@ class SunshineConfTests(unittest.TestCase):
             tv.add_prep_cmd("global_prep_cmd = [oops\n")
 
 
+class SunshineLogTests(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self.dir = tempfile.mkdtemp()
+        self.path = os.path.join(self.dir, "sunshine.log")
+        self.w = tv.SunshineLog(self.path)
+
+    def write(self, text, mode="a"):
+        with open(self.path, mode, encoding="utf-8") as f:
+            f.write(text)
+
+    def test_no_file_and_no_entries(self):
+        self.assertIsNone(self.w.poll())
+        self.write("[2026-11-04 15:00:00.000]: Info: Sunshine version: 2025\n")
+        self.assertIsNone(self.w.poll())
+
+    def test_pause_and_resume(self):
+        self.write("[x]: Info: CLIENT CONNECTED\n")
+        self.assertIs(self.w.poll(), True)
+        self.write("[x]: Info: CLIENT DISCONNECTED\n")
+        self.assertIs(self.w.poll(), False)
+        self.write("[x]: Info: Client connected\n")  # any case
+        self.assertIs(self.w.poll(), True)
+
+    def test_last_entry_wins_and_partial_line(self):
+        self.write("CLIENT CONNECTED\nCLIENT DISCONNECTED\nCLIENT CONN")
+        self.assertIs(self.w.poll(), False)  # unfinished line is not read yet
+        self.write("ECTED\n")
+        self.assertIs(self.w.poll(), True)
+
+    def test_sunshine_restart_truncates_log(self):
+        self.write("CLIENT CONNECTED\n" * 50)
+        self.assertIs(self.w.poll(), True)
+        self.write("[x]: Info: starting\n", mode="w")
+        self.assertIsNone(self.w.poll())
+
+
 class ConfigTests(unittest.TestCase):
     def test_merge(self):
         cfg = tv.merge_config({"mouse_speed": 900, "swap_xy": 1, "buttons": {"A": "key:SPACE", "B": 5},

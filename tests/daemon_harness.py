@@ -104,6 +104,12 @@ loader.exec_module(tv)
 
 tmp = tempfile.mkdtemp()
 tv.ACTIVE_FLAG = os.path.join(tmp, "active")
+tv.SUNSHINE_LOG = os.path.join(tmp, "sunshine.log")
+
+
+def sunshine_log(line):
+    with open(tv.SUNSHINE_LOG, "a", encoding="utf-8") as f:
+        f.write(f"[2026-11-04 15:00:00.000]: Info: {line}\n")
 tv.sunshine_running = lambda: True
 tv.focused_window_class = lambda: FOCUS[0]
 NOTES = []
@@ -124,6 +130,7 @@ def scenario():
     time.sleep(0.3)
     mark("before_stream")
     open(tv.ACTIVE_FLAG, "w").close()           # Sunshine: tv-pad on
+    sunshine_log("CLIENT CONNECTED")
     time.sleep(1.2)
     mark("stream_on")
     PAD.push(e.EV_ABS, e.ABS_X, 32767)           # left stick right
@@ -158,6 +165,18 @@ def scenario():
     PAD.push(e.EV_KEY, e.BTN_SOUTH, 0)
     time.sleep(0.3)
     mark("user_paused")
+    sunshine_log("CLIENT DISCONNECTED")         # TV turned off: stream paused
+    time.sleep(1.2)
+    PAD.push(e.EV_KEY, e.BTN_SOUTH, 1)
+    PAD.push(e.EV_KEY, e.BTN_SOUTH, 0)
+    time.sleep(0.3)
+    mark("stream_paused")
+    sunshine_log("CLIENT CONNECTED")            # stream resumed
+    time.sleep(1.2)
+    PAD.push(e.EV_KEY, e.BTN_SOUTH, 1)
+    PAD.push(e.EV_KEY, e.BTN_SOUTH, 0)
+    time.sleep(0.3)
+    mark("stream_resumed")
     os.remove(tv.ACTIVE_FLAG)                   # Sunshine: tv-pad off
     time.sleep(1.2)
     mark("stream_off")

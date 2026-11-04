@@ -59,8 +59,19 @@ class DaemonTest(unittest.TestCase):
         events = self.log[self.marks["pressed_in_game"][0]:self.marks["user_paused"][0]]
         self.assertNotIn((e.KEY_ENTER, 1), self.keys(events))
 
+    def test_paused_stream_releases_pad(self):
+        self.assertEqual(self.keys(self.between("user_paused", "stream_paused")), [])
+        grabs = self.r["grabs"][self.marks["user_paused"][1]:self.marks["stream_paused"][1]]
+        self.assertNotIn("grab", grabs)
+
+    def test_resumed_stream_takes_pad_again(self):
+        self.assertEqual(self.keys(self.between("stream_paused", "stream_resumed")),
+                         [(e.KEY_ENTER, 1), (e.KEY_ENTER, 0)])
+        grabs = self.r["grabs"][self.marks["stream_paused"][1]:self.marks["stream_resumed"][1]]
+        self.assertEqual(grabs, ["grab"])
+
     def test_stream_end(self):
-        self.assertEqual(self.keys(self.log[self.marks["user_paused"][0]:]), [])
+        self.assertEqual(self.keys(self.log[self.marks["stream_resumed"][0]:]), [])
         self.assertEqual(self.r["grabs"][-1], "ungrab")
 
 
