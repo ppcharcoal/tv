@@ -117,7 +117,9 @@ tv.notify = lambda text, enabled=True: NOTES.append(text)
 tv.load_config = lambda: tv.merge_config({"osk_command": []})
 SESSION_CALLS = []
 tv.Session.__init__.__defaults__ = (lambda cmd: SESSION_CALLS.append(cmd) or True,
-                                    lambda cfg: SESSION_CALLS.append("api-close") or True, False)
+                                    lambda cfg: SESSION_CALLS.append("api-close") or True, False,
+                                    lambda cmd: "VCP 10 C 55 100")
+tv.BRIGHTNESS_FILE = os.path.join(tmp, "brightness")
 
 marks = {}
 

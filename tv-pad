@@ -12,6 +12,7 @@ import functools
 import json
 import math
 import os
+import queue
 import re
 import selectors
 import shutil
@@ -23,7 +24,7 @@ import threading
 import time
 import urllib.request
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 APP = "tv-pad"
 
 RUNTIME_DIR = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
@@ -89,11 +90,16 @@ DEFAULT_CONFIG = {
         "View+Up": "screen",
         "View+Left": "end-stream",
     },
-    # PC monitor off / on during a stream. Turning outputs off in Hyprland (dpms) stops
-    # rendering and would freeze the stream, so the monitor itself is switched to standby
-    # over DDC/CI while the GPU keeps drawing. Needs ddcutil and the i2c-dev module.
-    "screen_off_command": ["ddcutil", "--noverify", "setvcp", "D6", "05"],
-    "screen_on_command": ["ddcutil", "--noverify", "setvcp", "D6", "01"],
+    # PC monitor off / on during a stream (View + Up). Turning the output off in Hyprland
+    # (dpms) stops rendering and would freeze the stream, so the GPU keeps drawing and only
+    # the monitor goes dark. Needs ddcutil and the i2c-dev module.
+    #   "brightness": backlight to 0 over DDC/CI and back to the remembered level. The
+    #                 monitor stays on, so it always comes back. (default)
+    #   "commands":   run screen_off_command / screen_on_command (e.g. DDC power mode D6;
+    #                 careful: many monitors cannot be woken from that over DDC)
+    "screen_mode": "brightness",
+    "screen_off_command": [],
+    "screen_on_command": [],
     # Ending the stream: with the Sunshine web UI login the app is closed through Sunshine's
     # API (clean); without it the Sunshine service is restarted (also ends the stream).
     "sunshine_url": "https://localhost:47990",
@@ -548,6 +554,26 @@ def run_quiet(cmd, timeout=10):
     return r.returncode == 0
 
 
+def query_quiet(cmd, timeout=10):
+    """Run a command and return its output, or None."""
+    if not cmd or not shutil.which(cmd[0]):
+        return None
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return r.stdout if r.returncode == 0 else None
+
+
+def parse_brightness(text):
+    """`ddcutil --brief getvcp 10` prints e.g. "VCP 10 C 70 100"; returns 70."""
+    m = re.search(r"VCP\s+10\s+C\s+(\d+)\s+\d+", text or "")
+    return int(m.group(1)) if m else None
+
+
+BRIGHTNESS_FILE = os.path.join(STATE_DIR, "brightness")
+
+
 def sunshine_close_app(cfg):
     """Ask Sunshine to close the running app (ends the stream and runs the prep undo)."""
     if not cfg["sunshine_user"]:
@@ -568,20 +594,65 @@ def sunshine_close_app(cfg):
 
 
 class Session:
-    """PC monitor standby and ending the stream. The callables are swappable for tests."""
+    """PC monitor dark / back and ending the stream. The callables are swappable for tests."""
 
-    def __init__(self, cfg, run=run_quiet, close_app=sunshine_close_app, background=True):
+    def __init__(self, cfg, run=run_quiet, close_app=sunshine_close_app, background=True, query=query_quiet):
         self.cfg = cfg
         self.run = run
+        self.query = query
         self.close_app = close_app
         self.background = background
         self.screen_off = False
+        self.jobs = queue.Queue()
+        self.worker = None
+        # A previous run may have left the monitor dimmed (crash, power loss of the session).
+        saved = self._read_saved()
+        if saved is not None:
+            self._go(lambda: self._restore(saved))
 
     def _go(self, fn):
-        if self.background:
-            threading.Thread(target=fn, daemon=True).start()
-        else:
+        """Run monitor / Sunshine jobs one after another, off the input loop."""
+        if not self.background:
             fn()
+            return
+        self.jobs.put(fn)
+        if self.worker is None or not self.worker.is_alive():
+            self.worker = threading.Thread(target=self._work, daemon=True)
+            self.worker.start()
+
+    def _work(self):
+        while True:
+            try:
+                fn = self.jobs.get(timeout=1)
+            except queue.Empty:
+                return
+            try:
+                fn()
+            except Exception as err:  # never let a failed command kill the worker
+                log(f"job failed: {err}")
+
+    def _read_saved(self):
+        try:
+            with open(BRIGHTNESS_FILE, encoding="utf-8") as f:
+                return int(f.read().strip())
+        except (OSError, ValueError):
+            return None
+
+    def _dim(self):
+        level = parse_brightness(self.query(["ddcutil", "--brief", "getvcp", "10"]))
+        if level:
+            os.makedirs(STATE_DIR, exist_ok=True)
+            with open(BRIGHTNESS_FILE, "w", encoding="utf-8") as f:
+                f.write(str(level))
+        self.run(["ddcutil", "--noverify", "setvcp", "10", "0"])
+
+    def _restore(self, level=None):
+        level = level or self._read_saved() or 70
+        self.run(["ddcutil", "--noverify", "setvcp", "10", str(level)])
+        try:
+            os.remove(BRIGHTNESS_FILE)
+        except FileNotFoundError:
+            pass
 
     def screen_toggle(self, notify_fn=notify):
         if self.screen_off:
@@ -589,13 +660,19 @@ class Session:
             notify_fn("Monitor włączony")
         else:
             self.screen_off = True
-            self._go(lambda: self.run(self.cfg["screen_off_command"]))
+            if self.cfg["screen_mode"] == "commands":
+                self._go(lambda: self.run(self.cfg["screen_off_command"]))
+            else:
+                self._go(self._dim)
             notify_fn("Monitor wygaszony (View + ↑ włącza)")
 
     def screen_on(self):
         if self.screen_off:
             self.screen_off = False
-            self._go(lambda: self.run(self.cfg["screen_on_command"]))
+            if self.cfg["screen_mode"] == "commands":
+                self._go(lambda: self.run(self.cfg["screen_on_command"]))
+            else:
+                self._go(self._restore)
 
     def end_stream(self, notify_fn=notify):
         self.screen_on()
@@ -686,6 +763,8 @@ class Desktop:
 
     def close(self):
         self.osk_stop()
+        if self.session.worker is not None:
+            self.session.worker.join(timeout=10)  # let a running monitor job finish
         self.session.background = False  # the process is about to exit: do it now
         self.screen_on()
         self.mouse.close()

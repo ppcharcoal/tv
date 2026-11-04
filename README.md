@@ -68,32 +68,26 @@ bind = ALT, TAB, bringactivetotop
 ## Wygaszanie monitora (View + ↑)
 
 Hyprland po wyłączeniu wyjścia (`dpms off`) przestaje renderować, więc stream by zamarzł.
-Dlatego tv-pad usypia sam monitor przez DDC/CI (`ddcutil`), a karta graficzna dalej rysuje obraz
-dla Sunshine. Po zakończeniu lub wstrzymaniu streamu monitor jest włączany automatycznie.
+Dlatego karta graficzna dalej rysuje obraz, a tv-pad tylko **ściemnia podświetlenie monitora
+do zera** przez DDC/CI (`ddcutil`) i potem przywraca zapamiętaną jasność. Monitor cały czas
+działa, więc zawsze da się go przywrócić. Po zakończeniu lub wstrzymaniu streamu (a nawet po
+awarii tv-pad) jasność wraca automatycznie.
 
 ```bash
 sudo pacman -S ddcutil
 echo i2c-dev | sudo tee /etc/modules-load.d/i2c-dev.conf
 sudo modprobe i2c-dev
-ddcutil detect                      # powinien pokazać monitor
-ddcutil setvcp D6 05; sleep 3; ddcutil setvcp D6 01   # test: gaśnie i wraca
+ddcutil detect                                  # powinno pokazać "Display 1"
+ddcutil --brief getvcp 10                       # aktualna jasność, np. "VCP 10 C 70 100"
+ddcutil setvcp 10 0; sleep 3; ddcutil setvcp 10 70    # test: ciemno i z powrotem
 ```
 
-Jeśli `ddcutil` pisze o braku uprawnień do `/dev/i2c-*`:
+Jeśli `ddcutil detect` pisze „Invalid display / DDC communication failed” przy działającym
+monitorze, włącz **DDC/CI** w menu monitora.
 
-```bash
-sudo groupadd -f i2c && sudo usermod -aG i2c $USER
-echo 'KERNEL=="i2c-[0-9]*", GROUP="i2c", MODE="0660"' | sudo tee /etc/udev/rules.d/45-i2c.rules
-sudo udevadm control --reload-rules && sudo udevadm trigger   # potem wyloguj się i zaloguj
-```
-
-Jeśli monitor po uśpieniu nie budzi się przez DDC (trzeba wcisnąć przycisk), zamiast usypiania
-możesz ściemniać podświetlenie do zera; w `config.json`:
-
-```json
-"screen_off_command": ["ddcutil", "--noverify", "setvcp", "10", "0"],
-"screen_on_command":  ["ddcutil", "--noverify", "setvcp", "10", "70"]
-```
+> Nie używaj trybu zasilania DDC (`setvcp D6 05`): wiele monitorów (np. Acer) traktuje go jak
+> wyłączenie przyciskiem i nie da się ich obudzić z komputera. Jeśli mimo to chcesz własne
+> komendy, ustaw `"screen_mode": "commands"` oraz `screen_off_command` / `screen_on_command`.
 
 ## Kończenie streamu (View + ←)
 

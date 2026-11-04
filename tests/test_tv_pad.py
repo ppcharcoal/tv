@@ -293,42 +293,86 @@ class SunshineLogTests(unittest.TestCase):
 class SessionTests(unittest.TestCase):
     def setUp(self):
         import tempfile
+        d = tempfile.mkdtemp()
         self.calls = []
-        self.flag = os.path.join(tempfile.mkdtemp(), "active")
+        self.flag = os.path.join(d, "active")
         open(self.flag, "w").close()
-        self.old_flag, tv.ACTIVE_FLAG = tv.ACTIVE_FLAG, self.flag
+        self.old = (tv.ACTIVE_FLAG, tv.BRIGHTNESS_FILE, tv.STATE_DIR)
+        tv.ACTIVE_FLAG, tv.BRIGHTNESS_FILE, tv.STATE_DIR = self.flag, os.path.join(d, "brightness"), d
         self.notes = []
 
     def tearDown(self):
-        tv.ACTIVE_FLAG = self.old_flag
+        tv.ACTIVE_FLAG, tv.BRIGHTNESS_FILE, tv.STATE_DIR = self.old
 
-    def session(self, api_ok):
-        cfg = tv.merge_config({})
-        return tv.Session(cfg, run=lambda cmd: self.calls.append(cmd) or True,
-                          close_app=lambda c: self.calls.append("api-close") or api_ok, background=False)
+    def session(self, api_ok=True, cfg=None, brightness="VCP 10 C 55 100\n"):
+        return tv.Session(tv.merge_config(cfg or {}),
+                          run=lambda cmd: self.calls.append(cmd) or True,
+                          close_app=lambda c: self.calls.append("api-close") or api_ok,
+                          background=False, query=lambda cmd: brightness)
 
-    def test_screen_toggle_uses_ddc_and_restores(self):
-        s = self.session(True)
+    def test_parse_brightness(self):
+        self.assertEqual(tv.parse_brightness("VCP 10 C 55 100"), 55)
+        self.assertIsNone(tv.parse_brightness("Display not found"))
+        self.assertIsNone(tv.parse_brightness(None))
+
+    def test_dims_and_restores_remembered_brightness(self):
+        s = self.session()
         s.screen_toggle(self.notes.append)
+        self.assertEqual(self.calls, [["ddcutil", "--noverify", "setvcp", "10", "0"]])
+        self.assertTrue(os.path.exists(tv.BRIGHTNESS_FILE))
         s.screen_toggle(self.notes.append)
-        self.assertEqual(self.calls, [["ddcutil", "--noverify", "setvcp", "D6", "05"],
-                                      ["ddcutil", "--noverify", "setvcp", "D6", "01"]])
+        self.assertEqual(self.calls[-1], ["ddcutil", "--noverify", "setvcp", "10", "55"])
+        self.assertFalse(os.path.exists(tv.BRIGHTNESS_FILE))
         s.screen_on()  # already on: nothing to do
         self.assertEqual(len(self.calls), 2)
 
+    def test_never_uses_power_mode_by_default(self):
+        s = self.session()
+        s.screen_toggle(self.notes.append)
+        s.screen_toggle(self.notes.append)
+        self.assertFalse(any("D6" in c for c in self.calls if isinstance(c, list)))
+
+    def test_unknown_brightness_falls_back_to_70(self):
+        s = self.session(brightness=None)
+        s.screen_toggle(self.notes.append)
+        s.screen_toggle(self.notes.append)
+        self.assertEqual(self.calls[-1], ["ddcutil", "--noverify", "setvcp", "10", "70"])
+
+    def test_left_dimmed_by_previous_run_is_restored(self):
+        with open(tv.BRIGHTNESS_FILE, "w") as f:
+            f.write("42")
+        self.session()
+        self.assertEqual(self.calls, [["ddcutil", "--noverify", "setvcp", "10", "42"]])
+
+    def test_commands_mode(self):
+        s = self.session(cfg={"screen_mode": "commands", "screen_off_command": ["off"], "screen_on_command": ["on"]})
+        s.screen_toggle(self.notes.append)
+        s.screen_toggle(self.notes.append)
+        self.assertEqual(self.calls, [["off"], ["on"]])
+
     def test_end_stream_turns_screen_on_and_closes_app(self):
-        s = self.session(True)
+        s = self.session()
         s.screen_toggle(self.notes.append)
         self.calls.clear()
         s.end_stream(self.notes.append)
-        self.assertEqual(self.calls, [["ddcutil", "--noverify", "setvcp", "D6", "01"], "api-close"])
+        self.assertEqual(self.calls, [["ddcutil", "--noverify", "setvcp", "10", "55"], "api-close"])
         self.assertFalse(os.path.exists(self.flag))
 
     def test_end_stream_falls_back_to_restarting_sunshine(self):
-        s = self.session(False)
+        s = self.session(api_ok=False)
         s.end_stream(self.notes.append)
         self.assertEqual(self.calls, ["api-close",
                                       ["systemctl", "--user", "restart", "app-dev.lizardbyte.app.Sunshine.service"]])
+
+    def test_background_jobs_run_in_order(self):
+        import time as _t
+        s = tv.Session(tv.merge_config({}), run=lambda cmd: (_t.sleep(0.05), self.calls.append(cmd)),
+                       close_app=lambda c: True, background=True, query=lambda cmd: "VCP 10 C 55 100")
+        s.screen_toggle(self.notes.append)   # dim (slow query+run)
+        s.screen_toggle(self.notes.append)   # restore, queued right behind it
+        s.worker.join(timeout=5)
+        self.assertEqual(self.calls, [["ddcutil", "--noverify", "setvcp", "10", "0"],
+                                      ["ddcutil", "--noverify", "setvcp", "10", "55"]])
 
     def test_api_needs_login(self):
         self.assertFalse(tv.sunshine_close_app(tv.merge_config({})))
