@@ -75,6 +75,22 @@ class FakePad:
 PAD = FakePad()
 
 
+class FakeKeyboard(FakePad):
+    """A physical USB keyboard at the PC (only used to wake the black monitor)."""
+    path = "/dev/input/event98"
+    name = "Logitech USB Keyboard"
+
+    def capabilities(self, absinfo=True):
+        return {e.EV_KEY: [e.KEY_A, e.KEY_Z, e.KEY_SPACE, e.KEY_ENTER, e.KEY_ESC]}
+
+    def grab(self):
+        GRABS.append("grab-keyboard")  # must never happen
+
+
+KBD = FakeKeyboard()
+KBD_OPEN = []  # every time tv-pad opened the keyboard
+
+
 class FakeUInput:
     def __init__(self, events, name):
         self.name = name
@@ -91,8 +107,15 @@ class FakeUInput:
 
 fake = types.ModuleType("evdev")
 fake.ecodes = e
-fake.InputDevice = lambda path: PAD
-fake.list_devices = lambda: [PAD.path]
+def input_device(path):
+    if path == KBD.path:
+        KBD_OPEN.append(time.time())
+        return KBD
+    return PAD
+
+
+fake.InputDevice = input_device
+fake.list_devices = lambda: [PAD.path, KBD.path]
 fake.UInput = FakeUInput
 sys.modules["evdev"] = fake
 
@@ -106,6 +129,7 @@ tmp = tempfile.mkdtemp()
 tv.ACTIVE_FLAG = os.path.join(tmp, "active")
 tv.STATE_DIR = tmp
 tv.SUNSHINE_LOG = os.path.join(tmp, "sunshine.log")
+tv.is_virtual_input = lambda path: False
 
 
 def sunshine_log(line):
@@ -119,12 +143,14 @@ tv.load_config = lambda: tv.merge_config({"osk_command": []})
 SESSION_CALLS = []
 tv.Session.__init__.__defaults__ = (lambda cmd: SESSION_CALLS.append(cmd) or True,
                                     lambda cfg: SESSION_CALLS.append("api-close") or True, False,
-                                    lambda cmd: "VCP 10 C 55 100")
+                                    lambda cmd: "VCP 10 C 55 100" if cmd[-1] == "10" else "VCP 12 C 40 100")
 tv.BRIGHTNESS_FILE = os.path.join(tmp, "brightness")
 with open(tv.BRIGHTNESS_FILE, "w") as f:   # as if the PC died while the monitor was dimmed
     f.write("33")
 
 marks = {}
+SESSION_MARK = {}
+KBD_STATE = {}
 FLAG_AFTER_END = []
 
 
@@ -142,6 +168,7 @@ def scenario():
     sunshine_log("CLIENT CONNECTED")
     time.sleep(1.2)
     mark("stream_on")
+    SESSION_MARK["stream_on"] = len(SESSION_CALLS)
     PAD.push(e.EV_ABS, e.ABS_X, 32767)           # left stick right
     time.sleep(0.4)
     PAD.push(e.EV_ABS, e.ABS_X, 0)
@@ -157,6 +184,12 @@ def scenario():
     PAD.push(e.EV_KEY, e.BTN_START, 0)
     time.sleep(0.3)
     mark("buttons")
+    SESSION_MARK["before_key"] = len(SESSION_CALLS)
+    KBD.push(e.EV_KEY, e.KEY_SPACE, 1)          # someone at the PC presses a key
+    KBD.push(e.EV_KEY, e.KEY_SPACE, 0)
+    time.sleep(0.5)
+    SESSION_MARK["after_key"] = len(SESSION_CALLS)
+    KBD_STATE["opens_after_wake"] = len(KBD_OPEN)
     FOCUS[0] = "xbox-play"                       # a game takes focus
     time.sleep(1.2)
     mark("focus_game")
@@ -240,4 +273,5 @@ def scenario():
 threading.Thread(target=scenario, daemon=True).start()
 tv.run_daemon()
 print(json.dumps({"log": LOG, "grabs": GRABS, "marks": marks, "notes": NOTES, "session": SESSION_CALLS,
+                  "session_marks": SESSION_MARK, "kbd_opens": len(KBD_OPEN), "kbd_state": KBD_STATE,
                   "flag_after_end": FLAG_AFTER_END[0], "flag_after_steam": os.path.exists(tv.ACTIVE_FLAG)}))

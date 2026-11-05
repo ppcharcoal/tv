@@ -59,6 +59,26 @@ class DaemonTest(unittest.TestCase):
         events = self.log[self.marks["pressed_in_game"][0]:self.marks["user_paused"][0]]
         self.assertNotIn((e.BTN_LEFT, 1), self.keys(events))
 
+    def test_stream_start_blanks_the_monitor(self):
+        calls = self.r["session"][:self.r["session_marks"]["stream_on"]]
+        self.assertIn(["ddcutil", "--noverify", "setvcp", "10", "0"], calls)
+        self.assertIn(["ddcutil", "--noverify", "setvcp", "12", "0"], calls)
+        self.assertTrue(any("Monitor wygaszony" in n for n in self.r["notes"]))
+
+    def test_key_on_physical_keyboard_wakes_the_monitor(self):
+        m = self.r["session_marks"]
+        self.assertEqual(self.r["session"][m["before_key"]:m["after_key"]],
+                         [["ddcutil", "--noverify", "setvcp", "12", "40"],
+                          ["ddcutil", "--noverify", "setvcp", "10", "55"]])
+        self.assertIn("Monitor włączony", self.r["notes"])
+        self.assertNotIn("grab-keyboard", self.r["grabs"])  # the keyboard is only listened to
+
+    def test_keyboard_is_read_only_while_the_monitor_is_black(self):
+        # opened when the stream starts, closed after waking; reopened only when the
+        # stream starts again (resume after pause, Steam stream), never in between
+        self.assertGreaterEqual(self.r["kbd_state"]["opens_after_wake"], 1)
+        self.assertLessEqual(self.r["kbd_opens"], 4)
+
     def test_brightness_left_from_a_crash_is_restored_at_start(self):
         self.assertEqual(self.r["session"][0], ["ddcutil", "--noverify", "setvcp", "10", "33"])
 
@@ -101,7 +121,7 @@ class DaemonTest(unittest.TestCase):
         self.assertGreaterEqual(sum(n.startswith("Gra:") for n in self.r["notes"]), 2)  # game + Steam stream
 
     def test_steam_stream_ends_with_view_left(self):
-        self.assertEqual(self.r["session"][1:], ["api-close", "api-close"])
+        self.assertEqual(self.r["session"].count("api-close"), 2)
         self.assertFalse(self.r["flag_after_steam"])
 
 

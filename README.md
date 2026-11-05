@@ -50,7 +50,6 @@ cd tv && git pull && makepkg -si && systemctl --user restart tv-pad
 | X | klawiatura ekranowa (pokaż/ukryj) |
 | Y | Super+R (launcher aplikacji) |
 | View (krótko) | Alt+Tab |
-| **View + ↑** | wygaś / włącz monitor komputera (stream działa dalej) |
 | **View + ←** | zakończ stream: monitor wraca, sterowanie padem gaśnie |
 | Start + B | Super+C (zamknij okno) |
 | LB / RB | Alt+← / Alt+→ (wstecz / dalej w przeglądarce) |
@@ -90,23 +89,38 @@ fokus. `tv-pad status` pokazuje, czy gra jest uruchomiona.
 Ustawienia: `watch_only_windows` (klasy okien gier), `watch_only_combos` (kombinacje, które działają
 w grze), `watch_only_apps` (aplikacje Sunshine traktowane jak gra).
 
-## Wygaszanie monitora (View + ↑)
+## Monitor komputera podczas streamu
+
+Gdy stream się zaczyna (także po wznowieniu), **monitor komputera robi się czarny**. Wybudza go
+**dowolny klawisz na fizycznej klawiaturze przy komputerze** (USB albo Bluetooth). Nie wybudzają
+go: klawiatura ekranowa, klawisze wysyłane padem przez tv-pad ani pisanie z telewizora przez
+Moonlight. Po zakończeniu lub wstrzymaniu streamu monitor wraca sam.
 
 Hyprland po wyłączeniu wyjścia (`dpms off`) przestaje renderować, więc stream by zamarzł.
-Dlatego karta graficzna dalej rysuje obraz, a tv-pad tylko **ściemnia podświetlenie monitora
-do zera** przez DDC/CI (`ddcutil`) i potem przywraca zapamiętaną jasność. Monitor cały czas
-działa, więc zawsze da się go przywrócić. Nic nie zostaje na stałe: jasność wraca po ponownym
-View + ↑, po zakończeniu lub wstrzymaniu streamu, po zatrzymaniu tv-pad, a nawet po awarii czy
-odcięciu prądu (poziom sprzed ściemnienia jest zapisany w `~/.local/state/tv-pad/brightness`
-i przywracany przy następnym starcie; jeśli jest nieznany, wraca 100%).
+Dlatego karta graficzna dalej rysuje obraz, a tv-pad przez DDC/CI (`ddcutil`) ustawia w monitorze
+**jasność i kontrast na 0**. Monitor cały czas działa, więc zawsze da się go przywrócić.
+Konfiguracji Hyprlanda tv-pad nie zmienia.
+
+Jasność i kontrast monitor zapamiętuje u siebie, więc tv-pad przed wygaszeniem zapisuje poprzednie
+wartości w `~/.local/state/tv-pad/brightness` i przywraca je: po wybudzeniu, po końcu lub pauzie
+streamu, po zatrzymaniu tv-pad, a po awarii czy odcięciu prądu przy następnym starcie (jeśli jasność
+jest nieznana, wraca 100%). Ręcznie: `tv-pad screen-on`.
+
+Klawiatury są otwierane tylko na czas, gdy monitor jest czarny, wyłącznie do odczytu (naciśnięcie
+trafia też normalnie na pulpit). Jeśli tv-pad nie ma do nich dostępu, monitor zostaje włączony
+i pojawia się powiadomienie; wtedy:
+
+```bash
+sudo usermod -aG input $USER    # potem wyloguj się i zaloguj
+```
+
+Wyłączenie wygaszania: `"blank_on_stream": false` w `config.json`.
 
 ```bash
 sudo pacman -S ddcutil
 echo i2c-dev | sudo tee /etc/modules-load.d/i2c-dev.conf
 sudo modprobe i2c-dev
 ddcutil detect                                  # powinno pokazać "Display 1"
-ddcutil --brief getvcp 10                       # aktualna jasność, np. "VCP 10 C 70 100"
-ddcutil setvcp 10 0; sleep 3; ddcutil setvcp 10 70    # test: ciemno i z powrotem
 ```
 
 Jeśli `ddcutil detect` pisze „Invalid display / DDC communication failed” przy działającym
@@ -181,7 +195,7 @@ Jeśli X i Y są zamienione, ustaw `"swap_xy": true`.
   jest tylko wstrzymany (wyłączony telewizor, wyjście z Moonlight), tv-pad rozpoznaje to po
   wpisach „CLIENT DISCONNECTED” / „CLIENT CONNECTED” w `~/.config/sunshine/sunshine.log`
   i oddaje pada, a po wznowieniu przejmuje go z powrotem. `tv-pad status` pokazuje, co widzi.
-- Ręcznie: `tv-pad on`, `tv-pad off`, `tv-pad status`.
+- Ręcznie: `tv-pad on`, `tv-pad off`, `tv-pad status`, `tv-pad screen-on`.
 - Log: `journalctl --user -u tv-pad -f`.
 
 ## Testy

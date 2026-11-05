@@ -24,7 +24,7 @@ import threading
 import time
 import urllib.request
 
-VERSION = "1.6.0"
+VERSION = "1.7.0"
 APP = "tv-pad"
 
 RUNTIME_DIR = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
@@ -97,20 +97,23 @@ DEFAULT_CONFIG = {
     # Hold the first control and press the second.
     "combos": {
         "Start+B": "key:LEFTMETA+C",
-        "View+Up": "screen",
         "View+Left": "end-stream",
         "Down+LB": "hypr:workspace -1",
         "Down+RB": "hypr:workspace +1",
         "Right+LB": "hypr:movetoworkspace -1",
         "Right+RB": "hypr:movetoworkspace +1",
     },
-    # PC monitor off / on during a stream (View + Up). Turning the output off in Hyprland
-    # (dpms) stops rendering and would freeze the stream, so the GPU keeps drawing and only
-    # the monitor goes dark. Needs ddcutil and the i2c-dev module.
-    #   "brightness": backlight to 0 over DDC/CI and back to the remembered level. The
-    #                 monitor stays on, so it always comes back. (default)
+    # The PC monitor goes black when a stream starts; any key on a physical keyboard at the
+    # PC brings it back (the on-screen keyboard, tv-pad's own keys and keys typed on the TV
+    # do not). Turning the output off in Hyprland (dpms) stops rendering and would freeze
+    # the stream, so the GPU keeps drawing and only the monitor goes black. Nothing in the
+    # Hyprland config is touched. Needs ddcutil and the i2c-dev module.
+    #   "brightness": brightness and contrast to 0 over DDC/CI, back to the remembered levels
+    #                 (kept on disk, so a crash or power cut is undone at the next start).
+    #                 The monitor stays on, so it always comes back. (default)
     #   "commands":   run screen_off_command / screen_on_command (e.g. DDC power mode D6;
     #                 careful: many monitors cannot be woken from that over DDC)
+    "blank_on_stream": True,
     "screen_mode": "brightness",
     "screen_off_command": [],
     "screen_on_command": [],
@@ -480,6 +483,41 @@ def is_gamepad(dev, e):
     return e.BTN_SOUTH in keys and e.ABS_X in axes and not dev.name.startswith(APP)
 
 
+def is_virtual_input(path):
+    """True for devices made by programs through uinput (tv-pad's own keyboard, Sunshine's
+    keyboard for keys typed on the TV, ...). They live under /sys/devices/virtual/input;
+    USB and Bluetooth (uhid) keyboards do not."""
+    node = os.path.basename(path)
+    real = os.path.realpath(f"/sys/class/input/{node}/device")
+    return real.startswith("/sys/devices/virtual/input/")
+
+
+def is_wake_keyboard(dev, e):
+    """A physical keyboard at the PC (any key on it wakes the black monitor)."""
+    keys = set(dev.capabilities(absinfo=False).get(e.EV_KEY, []))
+    if not {e.KEY_A, e.KEY_Z, e.KEY_SPACE, e.KEY_ENTER} <= keys:
+        return False
+    return not dev.name.startswith(APP) and not is_virtual_input(dev.path)
+
+
+def open_wake_keyboards(evdev, e):
+    """Open the physical keyboards (read only, not grabbed). Returns (devices, denied)."""
+    found, denied = [], 0
+    for path in evdev.list_devices():
+        try:
+            dev = evdev.InputDevice(path)
+        except PermissionError:
+            denied += 1
+            continue
+        except OSError:
+            continue
+        if is_wake_keyboard(dev, e):
+            found.append(dev)
+        else:
+            dev.close()
+    return found, denied
+
+
 # ----------------------------------------------------------------------------- environment
 
 class SunshineLog:
@@ -586,10 +624,17 @@ def query_quiet(cmd, timeout=10):
     return r.stdout if r.returncode == 0 else None
 
 
-def parse_brightness(text):
+def parse_vcp(text, code="10"):
     """`ddcutil --brief getvcp 10` prints e.g. "VCP 10 C 70 100"; returns 70."""
-    m = re.search(r"VCP\s+10\s+C\s+(\d+)\s+\d+", text or "")
+    m = re.search(rf"VCP\s+{code}\s+C\s+(\d+)\s+\d+", text or "", re.I)
     return int(m.group(1)) if m else None
+
+
+def parse_brightness(text):
+    return parse_vcp(text, "10")
+
+
+VCP_BRIGHTNESS, VCP_CONTRAST = "10", "12"
 
 
 BRIGHTNESS_FILE = os.path.join(PERSIST_DIR, "brightness")
@@ -703,41 +748,67 @@ class Session:
                 log(f"job failed: {err}")
 
     def _read_saved(self):
+        """Levels saved before the monitor went black: {"10": brightness, "12": contrast}.
+        An older tv-pad wrote just the brightness as a number."""
         try:
             with open(BRIGHTNESS_FILE, encoding="utf-8") as f:
-                return int(f.read().strip())
-        except (OSError, ValueError):
+                text = f.read().strip()
+        except OSError:
             return None
+        try:
+            data = json.loads(text)
+        except ValueError:
+            return None
+        if isinstance(data, int):
+            data = {VCP_BRIGHTNESS: data}
+        if not isinstance(data, dict):
+            return None
+        return {k: int(v) for k, v in data.items() if k in (VCP_BRIGHTNESS, VCP_CONTRAST)
+                and isinstance(v, int) and 0 <= v <= 100}
 
     def _dim(self):
-        level = parse_brightness(self.query(["ddcutil", "--brief", "getvcp", "10"]))
-        if level:
-            os.makedirs(PERSIST_DIR, exist_ok=True)
-            with open(BRIGHTNESS_FILE, "w", encoding="utf-8") as f:
-                f.write(str(level))
-                f.flush()
-                os.fsync(f.fileno())  # must survive a power cut while the monitor is dark
-        self.run(["ddcutil", "--noverify", "setvcp", "10", "0"])
+        saved = {}
+        for code in (VCP_BRIGHTNESS, VCP_CONTRAST):
+            level = parse_vcp(self.query(["ddcutil", "--brief", "getvcp", code]), code)
+            if level:
+                saved[code] = level
+        os.makedirs(PERSIST_DIR, exist_ok=True)
+        with open(BRIGHTNESS_FILE, "w", encoding="utf-8") as f:
+            json.dump(saved, f)
+            f.flush()
+            os.fsync(f.fileno())  # must survive a power cut while the monitor is black
+        self.run(["ddcutil", "--noverify", "setvcp", VCP_BRIGHTNESS, "0"])
+        if VCP_CONTRAST in saved:  # contrast only if it can be put back
+            self.run(["ddcutil", "--noverify", "setvcp", VCP_CONTRAST, "0"])
 
-    def _restore(self, level=None):
-        level = level or self._read_saved() or DEFAULT_BRIGHTNESS
-        self.run(["ddcutil", "--noverify", "setvcp", "10", str(level)])
+    def _restore(self, saved=None):
+        saved = saved if saved is not None else (self._read_saved() or {})
+        if VCP_CONTRAST in saved:
+            self.run(["ddcutil", "--noverify", "setvcp", VCP_CONTRAST, str(saved[VCP_CONTRAST])])
+        self.run(["ddcutil", "--noverify", "setvcp", VCP_BRIGHTNESS,
+                  str(saved.get(VCP_BRIGHTNESS) or DEFAULT_BRIGHTNESS)])
         try:
             os.remove(BRIGHTNESS_FILE)
         except FileNotFoundError:
             pass
+
+    def blank(self):
+        """Monitor black (no-op if it already is)."""
+        if self.screen_off:
+            return
+        self.screen_off = True
+        if self.cfg["screen_mode"] == "commands":
+            self._go(lambda: self.run(self.cfg["screen_off_command"]))
+        else:
+            self._go(self._dim)
 
     def screen_toggle(self, notify_fn=notify):
         if self.screen_off:
             self.screen_on()
             notify_fn("Monitor włączony")
         else:
-            self.screen_off = True
-            if self.cfg["screen_mode"] == "commands":
-                self._go(lambda: self.run(self.cfg["screen_off_command"]))
-            else:
-                self._go(self._dim)
-            notify_fn("Monitor wygaszony (View + ↑ włącza)")
+            self.blank()
+            notify_fn("Monitor wygaszony")
 
     def screen_on(self):
         if self.screen_off:
@@ -882,6 +953,26 @@ def run_daemon():
     stream_app = ""
     pause_window = watch_window = False
     game = False          # a game started with tv-pad-game is running
+    kbds = {}             # path -> keyboard, opened only while the monitor is black
+
+    def open_kbds():
+        devs, denied = open_wake_keyboards(evdev, e)
+        for dev in devs:
+            kbds[dev.path] = dev
+            sel.register(dev, selectors.EVENT_READ, ("kbd", dev.path))
+        return len(devs), denied
+
+    def close_kbds():
+        for dev in kbds.values():
+            try:
+                sel.unregister(dev)
+            except (KeyError, ValueError):
+                pass
+            try:
+                dev.close()
+            except OSError:
+                pass
+        kbds.clear()
     sunshine_log = SunshineLog(SUNSHINE_LOG)
     pads = {}          # path -> (InputDevice, PadState)
     sel = selectors.DefaultSelector()
@@ -911,9 +1002,13 @@ def run_daemon():
                 pass
         grabbed = want
 
+    not_pads = set()  # devices already checked (keyboards, mice...): not opened again
+
     def scan():
-        for path in evdev.list_devices():
-            if path in pads:
+        present = set(evdev.list_devices())
+        not_pads.intersection_update(present)  # unplugged: check again if it comes back
+        for path in present:
+            if path in pads or path in not_pads:
                 continue
             try:
                 dev = evdev.InputDevice(path)
@@ -921,6 +1016,7 @@ def run_daemon():
                 continue
             if not is_gamepad(dev, e):
                 dev.close()
+                not_pads.add(path)
                 continue
             info = {code: (ai.min, ai.max) for code, ai in dev.capabilities(absinfo=True).get(e.EV_ABS, [])}
             pads[path] = (dev, PadState(info, e))
@@ -976,8 +1072,20 @@ def run_daemon():
                         watch_mapper = Mapper(watch_only_config(cfg), e, desktop)
                     stream_app = read_stream_app()
                     log(f"stream started (app: {stream_app or 'unknown'})")
+                    blanked = False
+                    if cfg["blank_on_stream"]:
+                        found, denied = open_kbds()
+                        if found:
+                            desktop.session.blank()
+                            blanked = True
+                        else:
+                            # never leave the monitor black without a way to wake it
+                            desktop.notify("Monitor zostaje włączony: brak dostępu do klawiatury "
+                                           "(dodaj się do grupy input)" if denied else
+                                           "Monitor zostaje włączony: nie widzę klawiatury")
                     if not matches("watch_only_apps", stream_app):
-                        desktop.notify("Stream: pad steruje pulpitem")
+                        desktop.notify("Stream: pad steruje pulpitem" +
+                                       (". Monitor wygaszony, dowolny klawisz go włącza" if blanked else ""))
                 else:
                     for m in (mapper, watch_mapper):
                         if m:
@@ -1013,10 +1121,33 @@ def run_daemon():
             if paused and mapper:
                 mapper.release_all()
         set_grab(active and not paused and not watch)
+        if kbds and (not active or desktop is None or not desktop.session.screen_off):
+            close_kbds()
+        elif (not kbds and active and desktop is not None and desktop.session.screen_off
+              and now - last_scan < 0.01):  # blanked some other way: watch keyboards too
+            open_kbds()
 
         timeout = frame if (active and not paused) else 0.5
         for key, _ in sel.select(timeout=timeout):
             path = key.data
+            if isinstance(path, tuple):  # a keyboard: any key press wakes the monitor
+                kdev = kbds.get(path[1])
+                if kdev is None:
+                    continue
+                try:
+                    pressed = any(ev.type == e.EV_KEY and ev.value == 1 for ev in kdev.read())
+                except OSError:
+                    pressed = False
+                    try:
+                        sel.unregister(kdev)
+                    except (KeyError, ValueError):
+                        pass
+                    kbds.pop(path[1], None)
+                if pressed and desktop is not None and desktop.session.screen_off:
+                    desktop.screen_on()
+                    desktop.notify("Monitor włączony")
+                    close_kbds()
+                continue
             if path not in pads:
                 continue
             dev, state = pads[path]
@@ -1056,6 +1187,7 @@ def run_daemon():
             mapper.tick(min(0.05, now - last_tick))
         last_tick = now
 
+    close_kbds()
     for m in (mapper, watch_mapper):
         if m:
             m.release_all()
@@ -1225,7 +1357,8 @@ def cmd_test():
 def main(argv=None):
     parser = argparse.ArgumentParser(prog=APP, description="Gamepad control of the desktop while streaming to the TV.")
     parser.add_argument("command", nargs="?", default="run",
-                        choices=["run", "on", "off", "toggle", "status", "config", "setup-sunshine", "test", "version"])
+                        choices=["run", "on", "off", "toggle", "status", "config", "setup-sunshine", "test",
+                                 "screen-on", "version"])
     args = parser.parse_args(argv)
     if args.command == "run":
         run_daemon()
@@ -1243,6 +1376,12 @@ def main(argv=None):
         cmd_setup_sunshine()
     elif args.command == "test":
         cmd_test()
+    elif args.command == "screen-on":
+        if os.path.exists(BRIGHTNESS_FILE):
+            Session(load_config(), background=False)  # restores the saved levels
+            print("monitor: brightness and contrast restored")
+        else:
+            print("monitor: not blanked by tv-pad (nothing to restore)")
     elif args.command == "version":
         print(VERSION)
 

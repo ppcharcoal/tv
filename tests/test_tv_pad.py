@@ -2,6 +2,7 @@
 
 import importlib.machinery
 import importlib.util
+import json
 import os
 import sys
 import time
@@ -140,15 +141,9 @@ class ButtonTests(unittest.TestCase):
     def test_view_tap_is_alt_tab_and_view_combos(self):
         m, out, _ = make()
         m.control("View", True)
-        self.assertEqual(out.keys(), [])          # might become View+Up / View+Left
+        self.assertEqual(out.keys(), [])          # might become View+Left
         m.control("View", False)
         self.assertEqual(out.keys(), [(e.KEY_LEFTALT, True), (e.KEY_TAB, True), (e.KEY_TAB, False), (e.KEY_LEFTALT, False)])
-        out.events.clear()
-        m.control("View", True)
-        m.control("Up", True)
-        m.control("Up", False)
-        m.control("View", False)
-        self.assertEqual(out.events, [("screen",)])  # no arrow key, no Alt+Tab
         out.events.clear()
         m.control("View", True)
         m.control("Left", True)
@@ -330,16 +325,48 @@ class SessionTests(unittest.TestCase):
     def tearDown(self):
         tv.ACTIVE_FLAG, tv.BRIGHTNESS_FILE, tv.STATE_DIR = self.old
 
-    def session(self, api_ok=True, cfg=None, brightness="VCP 10 C 55 100\n"):
+    def session(self, api_ok=True, cfg=None, brightness="VCP 10 C 55 100\n", contrast=None):
+        def query(cmd):
+            return brightness if cmd[-1] == "10" else contrast
         return tv.Session(tv.merge_config(cfg or {}),
                           run=lambda cmd: self.calls.append(cmd) or True,
                           close_app=lambda c: self.calls.append("api-close") or api_ok,
-                          background=False, query=lambda cmd: brightness)
+                          background=False, query=query)
 
     def test_parse_brightness(self):
         self.assertEqual(tv.parse_brightness("VCP 10 C 55 100"), 55)
         self.assertIsNone(tv.parse_brightness("Display not found"))
         self.assertIsNone(tv.parse_brightness(None))
+
+    def test_blank_sets_brightness_and_contrast_to_zero_and_restores_both(self):
+        s = self.session(contrast="VCP 12 C 40 100\n")
+        s.blank()
+        self.assertEqual(self.calls, [["ddcutil", "--noverify", "setvcp", "10", "0"],
+                                      ["ddcutil", "--noverify", "setvcp", "12", "0"]])
+        with open(tv.BRIGHTNESS_FILE) as f:
+            self.assertEqual(json.load(f), {"10": 55, "12": 40})
+        s.blank()  # already black: nothing more
+        self.assertEqual(len(self.calls), 2)
+        s.screen_on()
+        self.assertEqual(self.calls[2:], [["ddcutil", "--noverify", "setvcp", "12", "40"],
+                                          ["ddcutil", "--noverify", "setvcp", "10", "55"]])
+        self.assertFalse(os.path.exists(tv.BRIGHTNESS_FILE))
+
+    def test_contrast_untouched_when_it_cannot_be_read(self):
+        s = self.session(contrast=None)
+        s.blank()
+        s.screen_on()
+        self.assertFalse(any(c[3] == "12" for c in self.calls if isinstance(c, list)))
+
+    def test_old_saved_format_is_restored(self):
+        with open(tv.BRIGHTNESS_FILE, "w") as f:
+            f.write("42")  # tv-pad <= 1.6 saved only the brightness
+        self.session()
+        self.assertEqual(self.calls, [["ddcutil", "--noverify", "setvcp", "10", "42"]])
+
+    def test_view_up_is_no_longer_bound(self):
+        self.assertNotIn("View+Up", tv.DEFAULT_CONFIG["combos"])
+        self.assertTrue(tv.DEFAULT_CONFIG["blank_on_stream"])
 
     def test_dims_and_restores_remembered_brightness(self):
         s = self.session()
@@ -580,6 +607,50 @@ class GameWrapperTests(unittest.TestCase):
 
     def test_no_arguments(self):
         self.assertEqual(self.run_wrapper().returncode, 2)
+
+
+class WakeKeyboardTests(unittest.TestCase):
+    class Dev:
+        def __init__(self, name, keys, path="/dev/input/event5"):
+            self.name, self.keys, self.path = name, keys, path
+
+        def capabilities(self, absinfo=False):
+            return {e.EV_KEY: self.keys}
+
+    FULL = [e.KEY_A, e.KEY_Z, e.KEY_SPACE, e.KEY_ENTER, e.KEY_ESC]
+
+    def setUp(self):
+        self.old = tv.is_virtual_input
+
+    def tearDown(self):
+        tv.is_virtual_input = self.old
+
+    def test_physical_keyboard(self):
+        tv.is_virtual_input = lambda path: False
+        self.assertTrue(tv.is_wake_keyboard(self.Dev("Logitech USB Keyboard", self.FULL), e))
+
+    def test_not_a_keyboard(self):
+        tv.is_virtual_input = lambda path: False
+        self.assertFalse(tv.is_wake_keyboard(self.Dev("Xbox Wireless Controller Keyboard", [e.KEY_RECORD]), e))
+        self.assertFalse(tv.is_wake_keyboard(self.Dev("Some Mouse", [e.BTN_LEFT]), e))
+
+    def test_virtual_keyboards_are_ignored(self):
+        tv.is_virtual_input = lambda path: False
+        self.assertFalse(tv.is_wake_keyboard(self.Dev("tv-pad keyboard", self.FULL), e))
+        tv.is_virtual_input = lambda path: True  # e.g. Sunshine's keyboard for typing on the TV
+        self.assertFalse(tv.is_wake_keyboard(self.Dev("Keyboard passthrough", self.FULL), e))
+
+    def test_is_virtual_input_by_sysfs(self):
+        import tempfile
+        d = tempfile.mkdtemp()
+        real_realpath = os.path.realpath
+        try:
+            os.path.realpath = lambda p: ("/sys/devices/virtual/input/input99" if "event7" in p
+                                          else "/sys/devices/pci0000:00/0000:00:14.0/usb1/1-2/input/input3")
+            self.assertTrue(tv.is_virtual_input("/dev/input/event7"))
+            self.assertFalse(tv.is_virtual_input("/dev/input/event3"))
+        finally:
+            os.path.realpath = real_realpath
 
 
 class ConfigTests(unittest.TestCase):
